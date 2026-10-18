@@ -5,10 +5,13 @@
 //! Then add a provider with base_url `http://127.0.0.1:9999/v1`. It echoes
 //! the last user message; if that message contains `RUN_TOOL` it first calls
 //! the client's shell tool (`Bash` for Claude Code, `shell` for Codex).
+//! Requests for the model `flaky` drop the connection halfway through the
+//! first answer, to exercise stream resumption.
 
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use futures_util::StreamExt;
 use serde_json::{json, Value};
 
 fn text_of(content: &Value) -> String {
@@ -23,12 +26,50 @@ fn text_of(content: &Value) -> String {
     }
 }
 
+fn flaky(messages: &[Value]) -> axum::response::Response {
+    let resuming = messages
+        .last()
+        .is_some_and(|m| text_of(&m["content"]).contains("cut off"));
+    let frame = |delta: Value, finish: Value| {
+        format!(
+            "data: {}\n\n",
+            json!({"choices":[{"delta":delta,"finish_reason":finish}]})
+        )
+    };
+    if resuming {
+        let body = frame(
+            json!({"content":"the quick brown fox jumps over the lazy dog."}),
+            json!(null),
+        ) + &frame(json!({}), json!("stop"))
+            + "data: [DONE]\n\n";
+        return ([("content-type", "text/event-stream")], body).into_response();
+    }
+    let head = frame(
+        json!({"content":"Before the outage, the quick brown fo"}),
+        json!(null),
+    );
+    let stream = futures_util::stream::iter([Ok::<_, std::io::Error>(head)]).chain(
+        futures_util::stream::once(async {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            Err(std::io::Error::other("simulated outage"))
+        }),
+    );
+    (
+        [("content-type", "text/event-stream")],
+        axum::body::Body::from_stream(stream),
+    )
+        .into_response()
+}
+
 async fn chat(Json(body): Json<Value>) -> axum::response::Response {
     if body["stream"] != true {
         return Json(json!({"choices": [{"message": {"role": "assistant", "content": "OK"}, "finish_reason": "stop"}]}))
             .into_response();
     }
     let messages = body["messages"].as_array().cloned().unwrap_or_default();
+    if body["model"] == "flaky" {
+        return flaky(&messages);
+    }
     // Clients append their own context to user turns, so look at all of them.
     let user_text: Vec<String> = messages
         .iter()

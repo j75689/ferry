@@ -5,6 +5,7 @@
 pub mod anthropic;
 pub mod config;
 pub mod presets;
+pub mod recovery;
 pub mod responses;
 pub mod router;
 pub mod server;

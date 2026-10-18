@@ -230,7 +230,7 @@ pub fn chat_events(response: reqwest::Response) -> impl Stream<Item = Event> + S
                 yield event;
             }
         }
-        for event in decoder.finish() {
+        for event in decoder.end_of_body() {
             yield event;
         }
     }

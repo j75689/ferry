@@ -20,6 +20,7 @@ use serde_json::{json, Value};
 
 use crate::anthropic::{self, AnthropicEncoder};
 use crate::config::{Config, ProviderKind};
+use crate::recovery::{continuation_request, OverlapTrimmer, MAX_RECOVERIES};
 use crate::responses::{self, ResponsesEncoder};
 use crate::router::{self, Target};
 use crate::stream::{Event, Usage};
@@ -255,6 +256,8 @@ struct Recorder {
     record: RequestRecord,
     started: Instant,
     done: bool,
+    /// Targets a broken stream was resumed on, filled in by [`resumable_events`].
+    resumed_on: Arc<Mutex<Vec<String>>>,
 }
 
 impl Recorder {
@@ -277,13 +280,21 @@ impl Recorder {
             },
             started: Instant::now(),
             done: false,
+            resumed_on: Arc::default(),
         }
     }
 
     fn observe(&mut self, event: &Event) {
         match event {
             Event::Usage(usage) => self.usage(*usage),
-            Event::Finish(_) => self.finish("ok".into()),
+            Event::Finish(_) => {
+                let resumed = self.resumed_on.lock().unwrap().clone();
+                if resumed.is_empty() {
+                    self.finish("ok".into());
+                } else {
+                    self.finish(format!("ok (resumed on {})", resumed.join(", ")));
+                }
+            }
             Event::Error(message) => self.finish(format!("error: {message}")),
             _ => {}
         }
@@ -334,6 +345,134 @@ impl Attempt<'_> {
     }
 }
 
+/// Builds the OpenAI Chat request for a target, or `None` if the target
+/// cannot serve this kind of request.
+type BuildRequest = Arc<dyn Fn(&Target) -> Option<Value> + Send + Sync>;
+
+/// Everything needed to reopen a request after its stream broke.
+struct Resume {
+    state: AppState,
+    config: Arc<Config>,
+    headers: HeaderMap,
+    targets: Vec<Target>,
+    build: BuildRequest,
+}
+
+/// Events from `first` (opened on `targets[index]`). If the stream breaks,
+/// the request is reopened (same target first, then fallbacks) and the
+/// answer continues from what the client already received.
+fn resumable_events(
+    resume: Resume,
+    mut index: usize,
+    first: reqwest::Response,
+    resumed_on: Arc<Mutex<Vec<String>>>,
+) -> impl Stream<Item = Event> + Send + 'static {
+    async_stream::stream! {
+        let mut response = first;
+        let mut delivered = String::new();
+        let mut usage = Usage::default();
+        let mut recoveries = 0;
+        let mut trimmer: Option<OverlapTrimmer> = None;
+        loop {
+            let mut failure = None;
+            {
+                let events = upstream::chat_events(response);
+                let mut events = std::pin::pin!(events);
+                while let Some(event) = events.next().await {
+                    match event {
+                        Event::Text(text) => {
+                            let text = match &mut trimmer {
+                                Some(trimmer) => trimmer.push(&text),
+                                None => text,
+                            };
+                            if !text.is_empty() {
+                                delivered.push_str(&text);
+                                yield Event::Text(text);
+                            }
+                        }
+                        // A resumed attempt re-thinks from scratch; once the
+                        // answer has started that would be a stray block mid-answer.
+                        Event::Reasoning(_) if trimmer.is_some() => {}
+                        Event::Reasoning(text) => yield Event::Reasoning(text),
+                        Event::Usage(more) => {
+                            usage.input_tokens += more.input_tokens;
+                            usage.output_tokens += more.output_tokens;
+                            usage.cached_tokens += more.cached_tokens;
+                            usage.reasoning_tokens += more.reasoning_tokens;
+                        }
+                        Event::Error(message) => {
+                            failure = Some(message);
+                            break;
+                        }
+                        other => {
+                            if let Some(rest) = trimmer.as_mut().map(OverlapTrimmer::finish) {
+                                if !rest.is_empty() {
+                                    delivered.push_str(&rest);
+                                    yield Event::Text(rest);
+                                }
+                            }
+                            let finished = matches!(other, Event::Finish(_));
+                            if finished && usage != Usage::default() {
+                                yield Event::Usage(usage);
+                            }
+                            yield other;
+                            if finished {
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+            let message = failure.unwrap_or_else(|| "provider stream ended unexpectedly".into());
+            if recoveries >= MAX_RECOVERIES {
+                yield Event::Error(message);
+                return;
+            }
+            recoveries += 1;
+            tracing::warn!(
+                target = %resume.targets[index].reference(),
+                delivered_chars = delivered.chars().count(),
+                error = %message,
+                "stream broke; resuming"
+            );
+            let timeout = Duration::from_secs(resume.config.server.connect_timeout_secs.max(5));
+            let mut reopened = None;
+            let mut last_error = None;
+            for (i, target) in resume.targets.iter().enumerate().skip(index) {
+                let Some(mut request) = (resume.build)(target) else { continue };
+                if !delivered.is_empty() {
+                    request = continuation_request(request, &delivered);
+                }
+                match upstream::send(
+                    resume.state.http(),
+                    &target.provider,
+                    &request,
+                    Some(&resume.headers),
+                    timeout,
+                    resume.config.server.max_retries,
+                )
+                .await
+                {
+                    Ok(next) => {
+                        reopened = Some((i, next));
+                        break;
+                    }
+                    Err(err) => last_error = Some(err),
+                }
+            }
+            let Some((i, next)) = reopened else {
+                let reason = last_error.map(|e| e.to_string()).unwrap_or_else(|| "no provider left".into());
+                yield Event::Error(format!("{message} (resume failed: {reason})"));
+                return;
+            };
+            index = i;
+            response = next;
+            resumed_on.lock().unwrap().push(resume.targets[i].reference());
+            trimmer = (!delivered.is_empty()).then(|| OverlapTrimmer::new(&delivered));
+        }
+    }
+}
+
 fn sse_response<S>(frames: S) -> Response
 where
     S: Stream<Item = (&'static str, Value)> + Send + 'static,
@@ -372,7 +511,7 @@ async fn messages(State(state): State<AppState>, headers: HeaderMap, body: Bytes
         headers: &headers,
     };
     let mut last_error = None;
-    for target in &targets {
+    for (index, target) in targets.iter().enumerate() {
         recorder.record.routed_model = target.reference();
         match target.provider.kind {
             ProviderKind::Anthropic => {
@@ -398,7 +537,20 @@ async fn messages(State(state): State<AppState>, headers: HeaderMap, body: Bytes
                     Ok(response) => {
                         let estimate = anthropic::estimate_input_tokens(&body);
                         let mut encoder = AnthropicEncoder::new(&requested, estimate);
-                        let events = upstream::chat_events(response);
+                        let source = body.clone();
+                        let resume = Resume {
+                            state: state.clone(),
+                            config: config.clone(),
+                            headers: headers.clone(),
+                            targets: targets.clone(),
+                            build: Arc::new(move |t: &Target| {
+                                (t.provider.kind == ProviderKind::OpenaiChat).then(|| {
+                                    anthropic::to_chat_request(&source, &t.model, &t.provider)
+                                })
+                            }),
+                        };
+                        let events =
+                            resumable_events(resume, index, response, recorder.resumed_on.clone());
                         if wants_stream {
                             let frames = async_stream::stream! {
                                 let mut recorder = recorder;
@@ -499,7 +651,7 @@ async fn responses_handler(
         headers: &headers,
     };
     let mut last_error = None;
-    for target in &targets {
+    for (index, target) in targets.iter().enumerate() {
         recorder.record.routed_model = target.reference();
         if target.provider.kind != ProviderKind::OpenaiChat {
             last_error = Some(UpstreamError {
@@ -515,7 +667,19 @@ async fn responses_handler(
         match attempt.open(target, &conversion.request).await {
             Ok(response) => {
                 let mut encoder = ResponsesEncoder::new(&requested, conversion.custom_tools);
-                let events = upstream::chat_events(response);
+                let source = body.clone();
+                let resume = Resume {
+                    state: state.clone(),
+                    config: config.clone(),
+                    headers: headers.clone(),
+                    targets: targets.clone(),
+                    build: Arc::new(move |t: &Target| {
+                        (t.provider.kind == ProviderKind::OpenaiChat).then(|| {
+                            responses::to_chat_request(&source, &t.model, &t.provider).request
+                        })
+                    }),
+                };
+                let events = resumable_events(resume, index, response, recorder.resumed_on.clone());
                 if wants_stream {
                     let frames = async_stream::stream! {
                         let mut recorder = recorder;

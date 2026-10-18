@@ -10,6 +10,7 @@ use axum::routing::post;
 use axum::{Json, Router};
 use ferry_proxy::stream::SseParser;
 use ferry_proxy::{AppState, Config};
+use futures_util::StreamExt;
 use serde_json::{json, Value};
 
 const TOKEN: &str = "test-token";
@@ -29,9 +30,60 @@ fn sse(chunks: &[Value]) -> Response {
     ([("content-type", "text/event-stream")], body).into_response()
 }
 
+/// A stream that stops early, optionally by aborting the connection.
+fn partial(texts: &[&str], abort: bool) -> Response {
+    let mut items: Vec<Result<String, std::io::Error>> = vec![Ok(format!(
+        "data: {}\n\n",
+        json!({"choices":[{"delta":{"reasoning_content":"thinking"}}]})
+    ))];
+    for text in texts {
+        items.push(Ok(format!(
+            "data: {}\n\n",
+            json!({"choices":[{"delta":{"content":text},"finish_reason":null}],"usage":{"prompt_tokens":5,"completion_tokens":1}})
+        )));
+    }
+    // Abort only after the content was flushed, like a real mid-stream drop.
+    let stream = futures_util::stream::iter(items).chain(futures_util::stream::once(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        if abort {
+            Err(std::io::Error::other("connection reset"))
+        } else {
+            Ok(String::new())
+        }
+    }));
+    let body = axum::body::Body::from_stream(stream);
+    ([("content-type", "text/event-stream")], body).into_response()
+}
+
 async fn chat(State(fake): State<Fake>, Json(body): Json<Value>) -> Response {
     fake.calls.fetch_add(1, Ordering::SeqCst);
     *fake.last_body.lock().unwrap() = body.clone();
+    let resuming = body["messages"]
+        .as_array()
+        .and_then(|m| m.last())
+        .and_then(|m| m["content"].as_str())
+        .is_some_and(|c| c.contains("cut off"));
+    match (body["model"].as_str(), resuming) {
+        // Cut off: ends without finish_reason or [DONE].
+        (Some("flaky"), false) => return partial(&["Hello wor"], false),
+        // Connection dies mid-body.
+        (Some("dropper"), false) => return partial(&["Line one.\nLine tw"], true),
+        (Some("always_broken"), _) => return partial(&["again and again "], true),
+        // Continuations restart the last words, as real models do.
+        (Some("flaky"), true) => {
+            return sse(&[
+                json!({"choices":[{"delta":{"content":"Hello world, resumed."}}]}),
+                json!({"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":3}}),
+            ])
+        }
+        (Some("dropper"), true) => {
+            return sse(&[
+                json!({"choices":[{"delta":{"content":"Line two.\nLine three."}}]}),
+                json!({"choices":[{"delta":{},"finish_reason":"stop"}]}),
+            ])
+        }
+        _ => {}
+    }
     if body["model"] == "broken" {
         return (
             StatusCode::BAD_REQUEST,
@@ -52,6 +104,13 @@ async fn chat(State(fake): State<Fake>, Json(body): Json<Value>) -> Response {
             json!({"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"ls\"}"}}]}}]}),
             json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}),
             json!({"choices":[],"usage":{"prompt_tokens":42,"completion_tokens":9}}),
+        ]);
+    }
+    if body["model"] == "interleaved" {
+        return sse(&[
+            json!({"choices":[{"delta":{"content":"Step 1."}}]}),
+            json!({"choices":[{"delta":{"reasoning_content":"now step 2"}}]}),
+            json!({"choices":[{"delta":{"content":" Step 2."},"finish_reason":"stop"}]}),
         ]);
     }
     sse(&[
@@ -273,4 +332,113 @@ async fn rejects_missing_token_and_lists_models() {
         .await
         .unwrap();
     assert_eq!(models["data"][0]["id"], "fake/good");
+}
+
+fn text_of(frames: &[(String, Value)]) -> String {
+    frames
+        .iter()
+        .filter_map(|(_, d)| {
+            d["delta"]["text"].as_str().or_else(|| {
+                d["delta"]
+                    .as_str()
+                    .filter(|_| d["type"] == "response.output_text.delta")
+            })
+        })
+        .collect()
+}
+
+async fn ask_claude(gateway: &str) -> Vec<(String, Value)> {
+    post_sse(
+        &format!("{gateway}/v1/messages"),
+        json!({"model": "claude-sonnet-4-5", "max_tokens": 100, "stream": true,
+               "messages": [{"role": "user", "content": "say hello"}]}),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn resumes_a_stream_cut_off_without_finish() {
+    let (upstream, fake) = start_fake().await;
+    let (gateway, state) = start_gateway(&upstream, "fake/flaky").await;
+    let frames = ask_claude(&gateway).await;
+    assert_eq!(text_of(&frames), "Hello world, resumed.");
+    assert_eq!(fake.calls.load(Ordering::SeqCst), 2);
+    // The continuation replayed what the client had already seen.
+    let sent = fake.last_body.lock().unwrap().clone();
+    let messages = sent["messages"].as_array().unwrap();
+    assert_eq!(messages[messages.len() - 2]["content"], "Hello wor");
+    // One text block, no duplicate thinking, usage summed over both attempts.
+    let starts: Vec<&str> = frames
+        .iter()
+        .filter(|(n, _)| n == "content_block_start")
+        .map(|(_, d)| d["content_block"]["type"].as_str().unwrap())
+        .collect();
+    assert_eq!(starts, ["thinking", "text"]);
+    let delta = frames.iter().find(|(n, _)| n == "message_delta").unwrap();
+    assert_eq!(delta.1["usage"]["output_tokens"], 4);
+    assert_eq!(
+        state.recent_requests()[0].outcome,
+        "ok (resumed on fake/flaky)"
+    );
+}
+
+#[tokio::test]
+async fn resumes_after_connection_reset() {
+    let (upstream, _) = start_fake().await;
+    let (gateway, _) = start_gateway(&upstream, "fake/dropper").await;
+    let frames = ask_claude(&gateway).await;
+    assert_eq!(text_of(&frames), "Line one.\nLine two.\nLine three.");
+    assert_eq!(frames.last().unwrap().0, "message_stop");
+}
+
+#[tokio::test]
+async fn gives_up_after_bounded_attempts() {
+    let (upstream, fake) = start_fake().await;
+    let (gateway, state) = start_gateway(&upstream, "fake/always_broken").await;
+    let frames = ask_claude(&gateway).await;
+    let (name, data) = frames.last().unwrap();
+    assert_eq!(name, "error");
+    assert!(
+        data["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("provider stream failed"),
+        "{data}"
+    );
+    // First attempt plus MAX_RECOVERIES continuations; the fallback
+    // (fake/good) is only used for opening, which succeeded every time.
+    assert_eq!(fake.calls.load(Ordering::SeqCst), 3);
+    assert!(state.recent_requests()[0].outcome.starts_with("error"));
+}
+
+#[tokio::test]
+async fn codex_stream_is_resumed_too() {
+    let (upstream, _) = start_fake().await;
+    let (gateway, _) = start_gateway(&upstream, "fake/flaky").await;
+    let frames = post_sse(
+        &format!("{gateway}/v1/responses"),
+        json!({"model": "fake/flaky", "stream": true,
+               "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}]}),
+    )
+    .await;
+    assert_eq!(text_of(&frames), "Hello world, resumed.");
+    let completed = &frames.last().unwrap().1["response"];
+    assert_eq!(completed["status"], "completed");
+    assert_eq!(
+        completed["output"][1]["content"][0]["text"],
+        "Hello world, resumed."
+    );
+}
+
+#[tokio::test]
+async fn reasoning_after_text_survives_when_nothing_broke() {
+    let (upstream, _) = start_fake().await;
+    let (gateway, _) = start_gateway(&upstream, "fake/interleaved").await;
+    let frames = ask_claude(&gateway).await;
+    let thinking: String = frames
+        .iter()
+        .filter_map(|(_, d)| d["delta"]["thinking"].as_str())
+        .collect();
+    assert_eq!(thinking, "now step 2");
+    assert_eq!(text_of(&frames), "Step 1. Step 2.");
 }

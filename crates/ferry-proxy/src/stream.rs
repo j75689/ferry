@@ -281,6 +281,25 @@ impl ChatStreamDecoder {
         out
     }
 
+    /// The response body ended. Without `[DONE]` or a `finish_reason` the
+    /// stream was cut off, which callers must not mistake for a full answer.
+    pub fn end_of_body(&mut self) -> Vec<Event> {
+        if self.done || self.finish.is_some() {
+            return self.finish();
+        }
+        self.done = true;
+        let mut out = Vec::new();
+        self.think.finish(&mut out);
+        // Partial answers are still billed; keep the count.
+        if let Some(usage) = self.usage {
+            out.push(Event::Usage(usage));
+        }
+        out.push(Event::Error(
+            "provider stream ended before the response finished".into(),
+        ));
+        out
+    }
+
     /// Flush buffered content; safe to call more than once.
     pub fn finish(&mut self) -> Vec<Event> {
         let mut out = Vec::new();
@@ -435,6 +454,20 @@ mod tests {
                 Event::Text("a <b> c".into()),
                 Event::Finish(Finish::Length),
             ]
+        );
+    }
+
+    #[test]
+    fn body_ending_without_finish_is_an_error() {
+        let mut decoder = ChatStreamDecoder::default();
+        decoder.push(&json!({"choices":[{"delta":{"content":"partial"},"finish_reason":null}]}));
+        let events = decoder.end_of_body();
+        assert!(matches!(events.last(), Some(Event::Error(_))));
+        let mut decoder = ChatStreamDecoder::default();
+        decoder.push(&json!({"choices":[{"delta":{"content":"done"},"finish_reason":"stop"}]}));
+        assert_eq!(
+            decoder.end_of_body().last(),
+            Some(&Event::Finish(Finish::Stop))
         );
     }
 
