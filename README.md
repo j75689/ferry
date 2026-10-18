@@ -52,10 +52,10 @@ codex ──model_providers.ferry──▶ │  /v1/responses (Codex)   │     
 
 1. Install the desktop app (CI builds `.dmg`, `.msi`/`.exe`, `.deb`/`.AppImage`).
 2. Open **Providers**, add one (for example NVIDIA NIM), paste the API key,
-   and click **測試連線** (test connection).
-3. On the **模型** (models) tab, pick the default model (and optionally the
+   and click **Test connection**.
+3. On the **Models** tab, pick the default model (and optionally the
    opus/sonnet/haiku mappings), then save. Changes apply immediately.
-4. On the **使用方式** (usage) tab, click **安裝命令列工具** (install CLI), then:
+4. On the **Usage** tab, click **Install CLI**, then:
 
 ```bash
 ferry claude                 # interactive Claude Code

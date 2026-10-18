@@ -39,20 +39,20 @@ function toast(message, ms = 2600) {
 async function copy(text) {
   try {
     await navigator.clipboard.writeText(text);
-    toast("已複製");
+    toast("Copied");
   } catch {
-    toast("無法存取剪貼簿");
+    toast("Clipboard is not available");
   }
 }
 
 function markDirty() {
   dirty = true;
-  document.querySelectorAll("[data-save]").forEach((b) => (b.textContent = "儲存 •"));
+  document.querySelectorAll("[data-save]").forEach((b) => (b.textContent = "Save •"));
 }
 
 function clearDirty() {
   dirty = false;
-  document.querySelectorAll("[data-save]").forEach((b) => (b.textContent = "儲存"));
+  document.querySelectorAll("[data-save]").forEach((b) => (b.textContent = "Save"));
 }
 
 // ---------- status ----------
@@ -60,11 +60,11 @@ function clearDirty() {
 function renderStatus() {
   const dot = $("status-dot");
   dot.className = "dot " + (snapshot.running ? "ok" : "bad");
-  $("status-text").textContent = snapshot.running ? `運作中 ${snapshot.url}` : "Gateway 未啟動";
+  $("status-text").textContent = snapshot.running ? `Running at ${snapshot.url}` : "Gateway stopped";
   const banner = $("banner");
   const problems = [];
   if (snapshot.error) problems.push(snapshot.error);
-  if (!snapshot.config.models.default) problems.push("尚未設定預設模型：先到「Providers」新增一個，再到「模型」選擇。");
+  if (!snapshot.config.models.default) problems.push("No default model yet: add a provider under Providers, then pick a model under Models.");
   banner.textContent = problems.join("\n");
   banner.classList.toggle("hidden", problems.length === 0);
 }
@@ -107,11 +107,11 @@ function renderProviderList() {
   list.replaceChildren(
     ...draft.providers.map((p, index) =>
       el("li", { class: index === selected ? "active" : "", onclick: () => { selected = index; renderProviders(); } },
-        el("span", {}, p.id || "(未命名)"),
+        el("span", {}, p.id || "(unnamed)"),
         el("span", { class: "kind" }, p.kind === "anthropic" ? "Anthropic" : "OpenAI")),
     ),
   );
-  if (draft.providers.length === 0) list.append(el("li", { class: "empty" }, "還沒有 provider"));
+  if (draft.providers.length === 0) list.append(el("li", { class: "empty" }, "No providers yet"));
 }
 
 function field(label, input, hint) {
@@ -122,7 +122,7 @@ function renderEditor() {
   const box = $("provider-editor");
   const p = draft.providers[selected];
   if (!p) {
-    box.replaceChildren(el("p", { class: "empty" }, "從左側選擇或新增一個 provider。"));
+    box.replaceChildren(el("p", { class: "empty" }, "Select a provider on the left, or add one."));
     return;
   }
   const preset = snapshot.presets.find((x) => x.id === p.id);
@@ -138,11 +138,11 @@ function renderEditor() {
   const fetchButton = el("button", { class: "ghost small", onclick: async (e) => {
     e.target.disabled = true;
     result.className = "result";
-    result.textContent = "讀取模型清單中…";
+    result.textContent = "Loading the model list…";
     try {
       const ids = await invoke("fetch_models", { provider: p });
       result.className = "result ok";
-      result.textContent = `找到 ${ids.length} 個模型（已列入下拉選單，可挑需要的貼到上方）。`;
+      result.textContent = `Found ${ids.length} models (added to the model suggestions; paste the ones you want above).`;
       const known = new Set(snapshot.advertised_models);
       ids.forEach((id) => known.add(`${p.id}/${id}`));
       snapshot.advertised_models = [...known];
@@ -153,13 +153,13 @@ function renderEditor() {
     } finally {
       e.target.disabled = false;
     }
-  } }, "從 provider 讀取模型");
+  } }, "Fetch models");
 
   const testButton = el("button", { class: "ghost small", onclick: async (e) => {
     const model = (p.models || [])[0] || "";
     e.target.disabled = true;
     result.className = "result";
-    result.textContent = `用 ${model || "(未填)"} 測試中…`;
+    result.textContent = `Testing with ${model || "(none)"}…`;
     try {
       result.textContent = await invoke("test_provider", { provider: p, model });
       result.className = "result ok";
@@ -169,7 +169,7 @@ function renderEditor() {
     } finally {
       e.target.disabled = false;
     }
-  } }, "測試連線");
+  } }, "Test connection");
 
   const input = (key, attrs = {}) => {
     const node = el("input", { ...attrs, oninput: update(key, attrs.type === "number" ? (v) => (v === "" ? null : Number(v)) : (v) => v) });
@@ -182,38 +182,38 @@ function renderEditor() {
     return el("label", { class: "check", title: hint }, node, label);
   };
   const kind = el("select", { onchange: update("kind") },
-    el("option", { value: "openai_chat" }, "OpenAI 相容（/chat/completions）"),
-    el("option", { value: "anthropic" }, "Anthropic 相容（/v1/messages，僅 Claude Code）"));
+    el("option", { value: "openai_chat" }, "OpenAI-compatible (/chat/completions)"),
+    el("option", { value: "anthropic" }, "Anthropic-compatible (/v1/messages, Claude Code only)"));
   kind.value = p.kind || "openai_chat";
 
   box.replaceChildren(
     el("div", { class: "row-between" },
-      el("h2", {}, p.id || "新 provider"),
-      preset && preset.key_url ? el("button", { class: "ghost small", onclick: () => openUrl(preset.key_url) }, "取得 API key ↗") : null),
+      el("h2", {}, p.id || "New provider"),
+      preset && preset.key_url ? el("button", { class: "ghost small", onclick: () => openUrl(preset.key_url) }, "Get an API key ↗") : null),
     el("div", { class: "grid" },
-      field("ID（用在模型名稱前綴）", input("id", { placeholder: "nim" })),
-      field("類型", kind)),
+      field("ID (prefix in model names)", input("id", { placeholder: "nim" })),
+      field("Type", kind)),
     field("Base URL", input("base_url", { placeholder: "https://…/v1", class: "mono" })),
     el("div", { class: "grid" },
-      field("API key", input("api_key", { type: "password", autocomplete: "off", placeholder: "本機模型可留空" })),
-      field("或從環境變數讀取", input("api_key_env", { placeholder: "例如 NVIDIA_API_KEY" }))),
-    field("模型（每行一個，不含 provider 前綴；第一個用來測試）", modelsArea),
+      field("API key", input("api_key", { type: "password", autocomplete: "off", placeholder: "Leave empty for local models" })),
+      field("Or read it from an environment variable", input("api_key_env", { placeholder: "e.g. NVIDIA_API_KEY" }))),
+    field("Models (one per line, without the provider prefix; the first is used for testing)", modelsArea),
     el("div", { class: "actions" }, fetchButton, testButton),
     result,
     el("div", { class: "grid" },
-      field("輸出 token 上限", input("max_tokens_cap", { type: "number", min: "1", placeholder: "不限制" }), "免費方案常限制輸出長度；Claude Code 預設會要求 32k。")),
-    check("reasoning_history", "回傳歷史推理內容（reasoning_content）", "DeepSeek 等思考模型在 tool call 時需要"),
-    check("send_reasoning_effort", "轉送推理強度（reasoning_effort）"),
-    check("stream_usage", "要求串流用量統計（stream_options）"),
+      field("Max output tokens", input("max_tokens_cap", { type: "number", min: "1", placeholder: "No limit" }), "Free tiers often limit output length; Claude Code asks for 32k by default.")),
+    check("reasoning_history", "Replay earlier reasoning (reasoning_content)", "Needed by DeepSeek-style thinking models around tool calls"),
+    check("send_reasoning_effort", "Forward reasoning effort (reasoning_effort)"),
+    check("stream_usage", "Request streamed usage (stream_options)"),
     el("div", { class: "actions" },
       el("button", { class: "danger", onclick: () => {
-        if (!confirm(`刪除 provider「${p.id}」？`)) return;
+        if (!confirm(`Delete provider "${p.id}"?`)) return;
         draft.providers.splice(selected, 1);
         selected = draft.providers.length ? 0 : null;
         markDirty();
         renderProviders();
-      } }, "刪除"),
-      el("button", { class: "primary", "data-save": true }, dirty ? "儲存 •" : "儲存")),
+      } }, "Delete"),
+      el("button", { class: "primary", "data-save": true }, dirty ? "Save •" : "Save")),
   );
 }
 
@@ -260,7 +260,7 @@ function renderUsage() {
   $("codex-env").textContent =
     `model_provider = "ferry"\nmodel = ${JSON.stringify(c.models.default || "provider/model")}\n\n` +
     `[model_providers.ferry]\nname = "Ferry"\nbase_url = "${url}/v1"\nwire_api = "responses"\nenv_key = "FERRY_API_KEY"\n\n` +
-    `# 另外在 shell 設定：export FERRY_API_KEY=${c.server.auth_token}`;
+    `# and in your shell: export FERRY_API_KEY=${c.server.auth_token}`;
 }
 
 // ---------- requests ----------
@@ -268,7 +268,7 @@ function renderUsage() {
 async function refreshRequests() {
   if (!$("tab-requests").classList.contains("active")) return;
   const rows = await invoke("recent_requests");
-  $("req-count").textContent = `${rows.length} 筆`;
+  $("req-count").textContent = `${rows.length} requests`;
   $("req-body").replaceChildren(
     ...rows.map((r) => {
       const ok = r.outcome.startsWith("ok");
@@ -310,7 +310,7 @@ function bindSettings() {
   });
   $("restart").addEventListener("click", async () => {
     apply(await invoke("restart_gateway"), false);
-    toast(snapshot.running ? "Gateway 已重新啟動" : "啟動失敗");
+    toast(snapshot.running ? "Gateway restarted" : "Gateway failed to start");
   });
 }
 
@@ -333,9 +333,9 @@ function apply(next, resetDraft = true) {
 async function save() {
   try {
     apply(await invoke("save_config", { config: draft }));
-    toast("已儲存，立即生效");
+    toast("Saved; changes apply immediately");
   } catch (err) {
-    toast(`儲存失敗：${err}`);
+    toast(`Save failed: ${err}`);
   }
 }
 
@@ -366,7 +366,7 @@ async function main() {
     try {
       toast(await invoke("install_cli"), 9000);
     } catch (err) {
-      toast(`安裝失敗：${err}`, 9000);
+      toast(`Install failed: ${err}`, 9000);
     }
   });
   window.addEventListener("beforeunload", (e) => { if (dirty) e.preventDefault(); });
@@ -392,5 +392,5 @@ async function main() {
 }
 
 main().catch((err) => {
-  document.body.prepend(el("div", { class: "banner" }, `介面初始化失敗：${err}`));
+  document.body.prepend(el("div", { class: "banner" }, `The settings UI failed to start: ${err}`));
 });

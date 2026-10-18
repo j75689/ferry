@@ -162,10 +162,10 @@ mod tests {
 
     #[test]
     fn handles_multibyte_text() {
-        let delivered = "這是一段被中斷的中文回答，到這裡";
-        let incoming = "被中斷的中文回答，到這裡就繼續寫下去";
+        let delivered = "Ünïcödé text — résumé naïve café, stopped hëre";
+        let incoming = "résumé naïve café, stopped hëre and continües";
         let skip = overlap(delivered, incoming);
-        assert_eq!(&incoming[skip..], "就繼續寫下去");
+        assert_eq!(&incoming[skip..], " and continües");
     }
 
     #[test]

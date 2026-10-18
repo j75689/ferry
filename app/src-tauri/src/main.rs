@@ -62,7 +62,7 @@ impl Gateway {
             }
             Err(err) => {
                 let message = format!(
-                    "無法監聽 {}:{}（{err}）。可能有其他程式佔用此 port，請在「設定」更換。",
+                    "Cannot listen on {}:{} ({err}). Another program may be using this port; change it under Settings.",
                     config.server.host, config.server.port
                 );
                 tracing::error!("{message}");
@@ -117,7 +117,8 @@ async fn save_config(gateway: State<'_, Gateway>, config: Config) -> Result<Snap
     if gateway.load_error.is_some() && gateway.path.exists() {
         // The file we could not parse may still hold hand-written settings.
         let backup = gateway.path.with_extension("toml.bak");
-        std::fs::copy(&gateway.path, &backup).map_err(|e| format!("無法備份舊設定檔：{e}"))?;
+        std::fs::copy(&gateway.path, &backup)
+            .map_err(|e| format!("Cannot back up the old config file: {e}"))?;
     }
     config.save(&gateway.path).map_err(|e| format!("{e:#}"))?;
     let rebind =
@@ -163,7 +164,7 @@ async fn test_provider(
     model: String,
 ) -> Result<String, String> {
     if model.trim().is_empty() {
-        return Err("請先填入要測試的模型名稱".into());
+        return Err("Enter a model name to test first".into());
     }
     let body = match provider.kind {
         ProviderKind::OpenaiChat => json!({
@@ -192,18 +193,18 @@ async fn test_provider(
     let value: Value = response
         .json()
         .await
-        .map_err(|e| format!("回應不是 JSON：{e}"))?;
+        .map_err(|e| format!("Response is not JSON: {e}"))?;
     let text = value
         .pointer("/choices/0/message/content")
         .or_else(|| value.pointer("/content/0/text"))
         .and_then(Value::as_str)
-        .unwrap_or("(空白回應)")
+        .unwrap_or("(empty response)")
         .trim()
         .chars()
         .take(120)
         .collect::<String>();
     Ok(format!(
-        "成功，{} ms：{text}",
+        "OK in {} ms: {text}",
         started.elapsed().as_millis()
     ))
 }
@@ -211,13 +212,13 @@ async fn test_provider(
 /// The `ferry` CLI ships next to the app executable as a Tauri sidecar.
 fn bundled_cli() -> Result<PathBuf, String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    let dir = exe.parent().ok_or("找不到 app 所在資料夾")?;
+    let dir = exe.parent().ok_or("Cannot find the app directory")?;
     let path = dir.join(if cfg!(windows) { "ferry.exe" } else { "ferry" });
     if path.exists() {
         Ok(path)
     } else {
         Err(format!(
-            "安裝包內找不到 ferry（{}）。開發版請先 cargo build -p ferry-cli。",
+            "The bundled ferry CLI is missing ({}). In development, run cargo build -p ferry-cli first.",
             path.display()
         ))
     }
@@ -234,11 +235,11 @@ fn install_cli() -> Result<String, String> {
     let dir = cli_install_dir()?;
     if source.parent() == Some(dir.as_path()) || on_path(source.parent().unwrap_or(&dir)) {
         return Ok(format!(
-            "ferry 已經在 PATH 裡（{}），可以直接使用。",
+            "ferry is already on PATH ({}); it is ready to use.",
             source.display()
         ));
     }
-    std::fs::create_dir_all(&dir).map_err(|e| format!("無法建立 {}：{e}", dir.display()))?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("Cannot create {}: {e}", dir.display()))?;
     let target = dir.join(source.file_name().unwrap_or_default());
     link_or_copy(&source, &target)?;
     let path_note = if on_path(&dir) {
@@ -247,7 +248,7 @@ fn install_cli() -> Result<String, String> {
         add_to_path(&dir)?
     };
     Ok(format!(
-        "已安裝到 {}。{path_note}重新開一個終端機後輸入 ferry claude 或 ferry codex 即可。",
+        "Installed to {}. {path_note}Open a new terminal and run ferry claude or ferry codex.",
         target.display()
     ))
 }
@@ -255,7 +256,7 @@ fn install_cli() -> Result<String, String> {
 #[cfg(not(windows))]
 fn cli_install_dir() -> Result<PathBuf, String> {
     Ok(dirs::home_dir()
-        .ok_or("找不到家目錄")?
+        .ok_or("Cannot find the home directory")?
         .join(".local")
         .join("bin"))
 }
@@ -263,7 +264,7 @@ fn cli_install_dir() -> Result<PathBuf, String> {
 #[cfg(windows)]
 fn cli_install_dir() -> Result<PathBuf, String> {
     Ok(dirs::data_local_dir()
-        .ok_or("找不到 LocalAppData")?
+        .ok_or("Cannot find LocalAppData")?
         .join("ferry")
         .join("bin"))
 }
@@ -272,20 +273,21 @@ fn cli_install_dir() -> Result<PathBuf, String> {
 fn link_or_copy(source: &std::path::Path, target: &std::path::Path) -> Result<(), String> {
     // A symlink keeps following app updates.
     let _ = std::fs::remove_file(target);
-    std::os::unix::fs::symlink(source, target).map_err(|e| format!("無法建立連結：{e}"))
+    std::os::unix::fs::symlink(source, target)
+        .map_err(|e| format!("Cannot create the symlink: {e}"))
 }
 
 #[cfg(windows)]
 fn link_or_copy(source: &std::path::Path, target: &std::path::Path) -> Result<(), String> {
     std::fs::copy(source, target)
         .map(|_| ())
-        .map_err(|e| format!("無法複製 ferry.exe：{e}"))
+        .map_err(|e| format!("Cannot copy ferry.exe: {e}"))
 }
 
 #[cfg(not(windows))]
 fn add_to_path(dir: &std::path::Path) -> Result<String, String> {
     Ok(format!(
-        "注意：{} 不在 PATH 中，請把它加入 shell 設定（例如 ~/.zshrc）。",
+        "Note: {} is not on PATH; add it in your shell profile (for example ~/.zshrc). ",
         dir.display()
     ))
 }
@@ -302,11 +304,11 @@ fn add_to_path(dir: &std::path::Path) -> Result<String, String> {
     let status = std::process::Command::new("powershell")
         .args(["-NoProfile", "-NonInteractive", "-Command", &script])
         .status()
-        .map_err(|e| format!("無法更新 PATH：{e}"))?;
+        .map_err(|e| format!("Cannot update PATH: {e}"))?;
     if status.success() {
-        Ok("已加入使用者 PATH。".into())
+        Ok("Added to the user PATH. ".into())
     } else {
-        Err("更新 PATH 失敗，請手動把資料夾加入 PATH。".into())
+        Err("Updating PATH failed; add the folder to PATH manually.".into())
     }
 }
 
@@ -331,7 +333,9 @@ fn main() {
         Ok(config) => (config, None),
         Err(err) => (
             Config::default(),
-            Some(format!("設定檔讀取失敗，暫用預設值：{err:#}")),
+            Some(format!(
+                "Could not read the config file; using defaults for now: {err:#}"
+            )),
         ),
     };
     let start_hidden = std::env::args().any(|a| a == "--hidden");
@@ -373,8 +377,8 @@ fn main() {
                 }
             });
 
-            let open = MenuItem::with_id(app, "open", "開啟 Ferry", true, None::<&str>)?;
-            let quit = MenuItem::with_id(app, "quit", "結束", true, None::<&str>)?;
+            let open = MenuItem::with_id(app, "open", "Open Ferry", true, None::<&str>)?;
+            let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&open, &quit])?;
             let mut tray = TrayIconBuilder::with_id("ferry")
                 .tooltip("Ferry gateway")
