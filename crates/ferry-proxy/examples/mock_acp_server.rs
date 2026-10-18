@@ -5,7 +5,8 @@
 //! (remembered in `$MOCK_ACP_STATE` or the system temp dir), offers two
 //! models, streams a thought and a reply, and when the prompt contains
 //! `RUN_TOOL` it calls the client's shell tool through the session's HTTP
-//! MCP server, the way the real agent uses client-provided tools.
+//! MCP server, the way the real agent uses client-provided tools. Like the
+//! real agent, it asks the client for permission before each tool call.
 
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
@@ -26,6 +27,25 @@ struct Session {
 }
 
 type Out = Arc<Mutex<std::io::Stdout>>;
+type Waiting = Arc<Mutex<HashMap<u64, tokio::sync::oneshot::Sender<Value>>>>;
+
+/// Ask the client for permission to call `tool`; true when it allowed it.
+async fn permitted(out: &Out, waiting: &Waiting, session: &str, tool: &str) -> bool {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1_000_000);
+    let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    waiting.lock().unwrap().insert(id, tx);
+    send(
+        out,
+        json!({"jsonrpc": "2.0", "id": id, "method": "session/request_permission", "params": {
+            "sessionId": session,
+            "toolCall": {"toolCallId": format!("perm-{id}"), "title": format!("mcp_ferry_{tool}"), "kind": "other"},
+            "options": [{"optionId": "proceed_once", "name": "Allow", "kind": "allow_once"},
+                        {"optionId": "cancel", "name": "Deny", "kind": "reject_once"}]}}),
+    );
+    let reply = rx.await.unwrap_or(Value::Null);
+    reply.pointer("/result/outcome/optionId") == Some(&json!("proceed_once"))
+}
 
 fn send(out: &Out, message: Value) {
     let mut out = out.lock().unwrap();
@@ -55,7 +75,12 @@ fn models(current: &str) -> Value {
                         {"value": "gemini-mock-flash", "name": "Gemini Mock Flash"}]}])
 }
 
-async fn call_tool(url: &str, token: &str, prompt: &str) -> Result<(), String> {
+async fn call_tool(
+    url: &str,
+    token: &str,
+    prompt: &str,
+    (out, waiting, session): (&Out, &Waiting, &str),
+) -> Result<(), String> {
     let http = reqwest::Client::new();
     let rpc = |id: u64, method: &str, params: Value| {
         http.post(url)
@@ -98,6 +123,9 @@ async fn call_tool(url: &str, token: &str, prompt: &str) -> Result<(), String> {
             prompt.len()
         ));
     };
+    if !permitted(out, waiting, session, name).await {
+        return Err("tool call denied by pre-tool hook: Denied by user (*)".into());
+    }
     rpc(
         3,
         "tools/call",
@@ -112,6 +140,7 @@ async fn call_tool(url: &str, token: &str, prompt: &str) -> Result<(), String> {
 async fn main() {
     let out: Out = Arc::new(Mutex::new(std::io::stdout()));
     let sessions: Arc<Mutex<HashMap<String, Session>>> = Arc::default();
+    let waiting: Waiting = Arc::default();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
     std::thread::spawn(move || {
         for line in std::io::stdin().lock().lines().map_while(Result::ok) {
@@ -124,6 +153,16 @@ async fn main() {
     while let Some(message) = rx.recv().await {
         let id = message["id"].clone();
         let params = message["params"].clone();
+        if message.get("method").is_none() {
+            // A reply to one of our own requests.
+            if let Some(tx) = id
+                .as_u64()
+                .and_then(|id| waiting.lock().unwrap().remove(&id))
+            {
+                let _ = tx.send(message);
+            }
+            continue;
+        }
         let reply = |result: Value| json!({"jsonrpc": "2.0", "id": id, "result": result});
         match message["method"].as_str().unwrap_or("") {
             "initialize" => send(
@@ -208,6 +247,7 @@ async fn main() {
                     )
                 };
                 let out = out.clone();
+                let waiting = waiting.clone();
                 tokio::spawn(async move {
                     chunk(
                         &out,
@@ -218,7 +258,8 @@ async fn main() {
                     let has_result = prompt.contains("### tool result");
                     if prompt.contains("RUN_TOOL") && !has_result {
                         if let Some((url, token)) = mcp {
-                            if let Err(err) = call_tool(&url, &token, &prompt).await {
+                            let asker = (&out, &waiting, session_id.as_str());
+                            if let Err(err) = call_tool(&url, &token, &prompt, asker).await {
                                 chunk(
                                     &out,
                                     &session_id,

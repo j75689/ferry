@@ -311,7 +311,12 @@ pub async fn open(
     let prompt = render_prompt(request, !system_supported, images);
     // Updates are read straight from the session channel: the agent sends
     // them before its prompt response, and that order must survive.
-    let mut updates = connection.subscribe(&session_id);
+    let tool_names = tools
+        .iter()
+        .filter_map(|t| t.pointer("/function/name").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect();
+    let mut updates = connection.subscribe(&session_id, tool_names);
     let (tx, mut rx) = mpsc::unbounded_channel::<Incoming>();
     tokio::spawn({
         let tx = tx.clone();

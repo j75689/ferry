@@ -16,8 +16,16 @@ How it is served: each request opens a fresh agent session. The conversation
 is rendered as a transcript, and the client's tools (Claude Code's or
 Codex's) are offered to the agent through a loopback MCP server. When the
 agent calls one, Ferry ends the turn and returns it to the client as a normal
-tool call; the result goes back with the next request. The agent's own tools
-are refused, and it runs in an empty working directory.
+tool call; the result goes back with the next request. When the agent asks
+for permission to call one of these client tools, Ferry allows it, since the
+call only reaches the client, which applies its own permission checks. The
+agent's own tools are refused, and it runs in an empty working directory.
+
+If every tool call fails with `tool call denied by pre-tool hook`, look at
+`~/.gemini/config/hooks.json` (`%USERPROFILE%\.gemini\config\hooks.json`
+on Windows). The ACP server runs the `PreToolUse` hooks that other tools
+install there, and a hook that answers `{}` instead of an explicit decision
+denies every call. Remove that hook, or have it answer `{"decision": "ask"}`.
 
 Caveats: this uses the agent as a model, which Google does not document as a
 supported use. Review Google's terms before relying on it. The server

@@ -30,7 +30,14 @@ impl std::fmt::Display for RpcError {
 }
 
 type Pending = Mutex<HashMap<u64, oneshot::Sender<Result<Value, RpcError>>>>;
-type Sessions = Mutex<HashMap<String, mpsc::UnboundedSender<Value>>>;
+type Sessions = Mutex<HashMap<String, Session>>;
+
+/// A session Ferry is reading updates for.
+struct Session {
+    updates: mpsc::UnboundedSender<Value>,
+    /// Names of the client tools exposed to it through Ferry's MCP server.
+    tools: Vec<String>,
+}
 
 /// A running agent process plus its `initialize` result.
 pub struct Connection {
@@ -192,12 +199,18 @@ impl Connection {
     }
 
     /// Receive `session/update` payloads for `session_id` until unsubscribed.
-    pub fn subscribe(&self, session_id: &str) -> mpsc::UnboundedReceiver<Value> {
+    /// `tools` are the client tools the session reaches through Ferry's MCP
+    /// server; the agent may call those when it asks for permission.
+    pub fn subscribe(
+        &self,
+        session_id: &str,
+        tools: Vec<String>,
+    ) -> mpsc::UnboundedReceiver<Value> {
         let (tx, rx) = mpsc::unbounded_channel();
         self.sessions
             .lock()
             .unwrap()
-            .insert(session_id.to_string(), tx);
+            .insert(session_id.to_string(), Session { updates: tx, tools });
         rx
     }
 
@@ -257,7 +270,12 @@ fn dispatch(
         (Some(method), Some(id)) => {
             let reply = match method {
                 "session/request_permission" => {
-                    json!({"jsonrpc": "2.0", "id": id, "result": {"outcome": reject(&message["params"])}})
+                    let params = &message["params"];
+                    let tools = params["sessionId"]
+                        .as_str()
+                        .and_then(|id| sessions.lock().unwrap().get(id).map(|s| s.tools.clone()))
+                        .unwrap_or_default();
+                    json!({"jsonrpc": "2.0", "id": id, "result": {"outcome": decide(params, &tools)}})
                 }
                 _ => json!({"jsonrpc": "2.0", "id": id,
                             "error": {"code": -32601, "message": format!("{method} is not supported by Ferry")}}),
@@ -269,45 +287,127 @@ fn dispatch(
             let Some(session_id) = params["sessionId"].as_str() else {
                 return;
             };
-            if let Some(tx) = sessions.lock().unwrap().get(session_id) {
-                let _ = tx.send(params);
+            if let Some(session) = sessions.lock().unwrap().get(session_id) {
+                let _ = session.updates.send(params);
             }
         }
         _ => {}
     }
 }
 
-/// Pick the agent's own "reject" option, falling back to a cancellation.
-fn reject(params: &Value) -> Value {
-    let options = params["options"].as_array().cloned().unwrap_or_default();
-    let choice = ["reject_once", "reject_always"].iter().find_map(|kind| {
+/// Answer a permission request. Calling one of Ferry's own MCP tools only
+/// hands the call back to the client, which applies its own permission
+/// checks, so those are allowed once. Anything else is the agent's built-in
+/// tooling and is rejected.
+fn decide(params: &Value, tools: &[String]) -> Value {
+    let tool_call = &params["toolCall"];
+    if let Some(tool) = ferry_tool(tool_call, tools) {
+        if let Some(outcome) = pick(params, &["allow_once", "allow_always"]) {
+            tracing::debug!(tool, "allowed the agent to call a client tool");
+            return outcome;
+        }
+    }
+    tracing::info!(
+        title = tool_call["title"].as_str().unwrap_or(""),
+        kind = tool_call["kind"].as_str().unwrap_or(""),
+        "rejected a permission request from the agent"
+    );
+    pick(params, &["reject_once", "reject_always"])
+        .unwrap_or_else(|| json!({"outcome": "cancelled"}))
+}
+
+/// Select the first option of one of `kinds`, in order.
+fn pick(params: &Value, kinds: &[&str]) -> Option<Value> {
+    let options = params["options"].as_array()?;
+    kinds.iter().find_map(|kind| {
         options
             .iter()
             .find(|o| o["kind"] == *kind)
             .and_then(|o| o["optionId"].as_str())
-    });
-    match choice {
-        Some(option_id) => json!({"outcome": "selected", "optionId": option_id}),
-        None => json!({"outcome": "cancelled"}),
+            .map(|id| json!({"outcome": "selected", "optionId": id}))
+    })
+}
+
+/// The client tool a permission request is for, when the agent names it as
+/// a tool of Ferry's MCP server (`mcp_ferry_Bash`, `Bash (ferry MCP Server)`,
+/// `ferry/Bash`, ...) or by its bare name.
+fn ferry_tool<'a>(tool_call: &Value, tools: &'a [String]) -> Option<&'a str> {
+    let mut names: Vec<&str> = ["title", "name", "toolName"]
+        .iter()
+        .filter_map(|key| tool_call[*key].as_str())
+        .collect();
+    if let Some(meta) = tool_call["_meta"].as_object() {
+        names.extend(meta.values().filter_map(Value::as_str));
     }
+    tools.iter().map(String::as_str).find(|tool| {
+        names.iter().map(|n| n.trim()).any(|name| {
+            name == *tool
+                || [
+                    "mcp_ferry_",
+                    "mcp__ferry__",
+                    "ferry__",
+                    "ferry_",
+                    "ferry/",
+                    "ferry.",
+                    "ferry:",
+                ]
+                .iter()
+                .any(|prefix| name.strip_prefix(prefix) == Some(tool))
+                || name
+                    .strip_prefix(tool)
+                    .is_some_and(|rest| rest.trim_start().starts_with("(ferry"))
+        })
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn permission_requests_are_rejected() {
-        let params = json!({"options": [
+    fn request(title: &str) -> Value {
+        json!({"sessionId": "s", "toolCall": {"toolCallId": "t", "title": title, "kind": "other"},
+        "options": [
             {"optionId": "a", "kind": "allow_once", "name": "Allow"},
             {"optionId": "r", "kind": "reject_once", "name": "Reject"}
-        ]});
+        ]})
+    }
+
+    #[test]
+    fn client_tools_are_allowed() {
+        let tools = vec!["Bash".to_string(), "Read".to_string()];
+        let allow = json!({"outcome": "selected", "optionId": "a"});
+        for title in [
+            "Bash",
+            "mcp_ferry_Bash",
+            "ferry__Read",
+            "Read (ferry MCP Server)",
+            "ferry/Bash",
+        ] {
+            assert_eq!(decide(&request(title), &tools), allow, "{title}");
+        }
+        let mut meta = request("Calling a tool");
+        meta["toolCall"]["_meta"] = json!({"toolName": "mcp_ferry_Read"});
+        assert_eq!(decide(&meta, &tools), allow);
+    }
+
+    #[test]
+    fn other_permission_requests_are_rejected() {
+        let tools = vec!["Bash".to_string()];
+        let reject = json!({"outcome": "selected", "optionId": "r"});
+        for title in [
+            "run_command",
+            "Run git status",
+            "mcp_other_Bash",
+            "Bash2",
+            "BashOutput (other)",
+        ] {
+            assert_eq!(decide(&request(title), &tools), reject, "{title}");
+        }
+        assert_eq!(decide(&request("Bash"), &[]), reject);
+        let no_allow = json!({"toolCall": {"title": "Bash"}, "options": [{"optionId": "r", "kind": "reject_once"}]});
+        assert_eq!(decide(&no_allow, &tools), reject);
         assert_eq!(
-            reject(&params),
-            json!({"outcome": "selected", "optionId": "r"})
-        );
-        assert_eq!(
-            reject(&json!({"options": []})),
+            decide(&json!({"options": []}), &tools),
             json!({"outcome": "cancelled"})
         );
     }
