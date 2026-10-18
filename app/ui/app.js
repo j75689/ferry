@@ -444,6 +444,9 @@ function renderSettings() {
   $("s-retries").value = s.max_retries;
   $("s-token").value = s.auth_token;
   $("config-path").textContent = snapshot.config_path;
+  const o = draft.optimizations || {};
+  $("o-titles").checked = o.local_session_titles !== false;
+  $("o-quota").checked = o.local_quota_probe !== false;
 }
 
 function bindSettings() {
@@ -453,6 +456,12 @@ function bindSettings() {
   $("s-timeout").addEventListener("input", num("connect_timeout_secs"));
   $("s-retries").addEventListener("input", num("max_retries"));
   $("s-token").addEventListener("input", (e) => { draft.server.auth_token = e.target.value.trim(); markDirty(); });
+  const toggle = (key) => (e) => {
+    draft.optimizations = { local_session_titles: true, local_quota_probe: true, ...draft.optimizations, [key]: e.target.checked };
+    markDirty();
+  };
+  $("o-titles").addEventListener("change", toggle("local_session_titles"));
+  $("o-quota").addEventListener("change", toggle("local_quota_probe"));
   $("regen-token").addEventListener("click", async () => {
     draft.server.auth_token = await invoke("new_token");
     $("s-token").value = draft.server.auth_token;

@@ -443,6 +443,33 @@ async fn reasoning_after_text_survives_when_nothing_broke() {
     assert_eq!(text_of(&frames), "Step 1. Step 2.");
 }
 
+#[tokio::test]
+async fn session_titles_are_answered_without_the_provider() {
+    let (upstream, fake) = start_fake().await;
+    let (gateway, state) = start_gateway(&upstream, "fake/good").await;
+    let frames = post_sse(
+        &format!("{gateway}/v1/messages"),
+        json!({
+            "model": "claude-haiku-4-5", "max_tokens": 128000, "stream": true, "tools": [],
+            "output_config": {"format": {"type": "json_schema", "schema": {
+                "type": "object", "properties": {"title": {"type": "string"}}}}},
+            "system": [{"type": "text", "text": "You are naming a coding session so the user can pick it out."}],
+            "messages": [{"role": "user", "content": "<session>\nrefactor the config loader\n</session>"}]
+        }),
+    )
+    .await;
+    assert_eq!(fake.calls.load(Ordering::SeqCst), 0);
+    let text: String = frames
+        .iter()
+        .filter_map(|(_, d)| d["delta"]["text"].as_str())
+        .collect();
+    assert_eq!(text, r#"{"title":"Refactor the config loader"}"#);
+    assert_eq!(frames.last().unwrap().0, "message_stop");
+    let record = &state.recent_requests()[0];
+    assert_eq!(record.outcome, "ok (local session title)");
+    assert_eq!(record.routed_model, "local");
+}
+
 /// An Anthropic-compatible upstream that answers every turn with a shell call.
 async fn anthropic_upstream(seen: Arc<std::sync::Mutex<Value>>) -> String {
     let app = Router::new().route(

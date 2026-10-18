@@ -5,6 +5,7 @@
 pub mod acp;
 pub mod anthropic;
 pub mod config;
+pub mod local;
 pub mod presets;
 pub mod recovery;
 pub mod responses;

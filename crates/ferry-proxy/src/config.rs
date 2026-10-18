@@ -17,6 +17,28 @@ pub struct Config {
     pub models: ModelConfig,
     #[serde(default)]
     pub providers: Vec<ProviderConfig>,
+    #[serde(default)]
+    pub optimizations: Optimizations,
+}
+
+/// Requests Ferry answers itself instead of spending a provider call.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Optimizations {
+    /// Claude Code asks for a session title on every turn.
+    #[serde(default = "default_true")]
+    pub local_session_titles: bool,
+    /// Older Claude Code versions probe the quota with a one-token request.
+    #[serde(default = "default_true")]
+    pub local_quota_probe: bool,
+}
+
+impl Default for Optimizations {
+    fn default() -> Self {
+        Self {
+            local_session_titles: true,
+            local_quota_probe: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -151,6 +173,7 @@ impl Default for Config {
             },
             models: ModelConfig::default(),
             providers: Vec::new(),
+            optimizations: Optimizations::default(),
         }
     }
 }

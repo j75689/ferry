@@ -31,6 +31,10 @@ codex ──model_providers.ferry──▶ │  /v1/responses (Codex)   │     
 * Requests for `opus` / `sonnet` / `haiku` map to configured models. On an
   error before streaming starts, retryable errors are retried and then the
   configured fallbacks are tried in order.
+* Housekeeping requests are answered locally: interactive Claude Code asks
+  the model for a session title on every turn, and Ferry replies itself
+  instead (a quota probe from older versions is handled the same way). Both
+  can be switched off under `[optimizations]` or in the app's Settings.
 * Every provider kind serves both clients: Claude Code and Codex requests are
   converted to OpenAI Chat, Anthropic Messages, or ACP as the target needs.
   Claude Code requests to Anthropic-type providers are passed through as-is.
@@ -153,8 +157,6 @@ cd app/src-tauri && cargo tauri build --config tauri.release.conf.json
 
 ## Not yet
 
-* Local short-circuits for Claude Code's background requests (titles,
-  quota probes); they currently go to the configured haiku model.
 * Server-side tools (`web_search`, `web_fetch`) are dropped rather than
   emulated.
 * Codex prints a "model metadata not found" notice for non-OpenAI model names.

@@ -21,10 +21,11 @@ use serde_json::{json, Value};
 use crate::acp::{self, AcpManager};
 use crate::anthropic::{self, AnthropicEncoder};
 use crate::config::{Config, ProviderKind};
+use crate::local;
 use crate::recovery::{continuation_request, OverlapTrimmer, MAX_RECOVERIES};
 use crate::responses::{self, ResponsesEncoder};
 use crate::router::{self, Target};
-use crate::stream::{Event, Usage};
+use crate::stream::{Event, Finish, Usage};
 use crate::upstream::{self, EventStream, UpstreamError};
 
 const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
@@ -329,6 +330,15 @@ impl Recorder {
 impl Drop for Recorder {
     fn drop(&mut self) {
         self.record.duration_ms = self.started.elapsed().as_millis() as u64;
+        let r = &self.record;
+        tracing::info!(
+            api = r.api,
+            requested = %r.requested_model,
+            routed = %r.routed_model,
+            outcome = %r.outcome,
+            ms = r.duration_ms,
+            "request"
+        );
         self.state.record(self.record.clone());
     }
 }
@@ -540,6 +550,11 @@ async fn messages(State(state): State<AppState>, headers: HeaderMap, body: Bytes
         .to_string();
     let wants_stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let mut recorder = Recorder::new(&state, "messages", &requested);
+    if let Some(reply) = local::answer(&body, &config.optimizations) {
+        recorder.record.routed_model = "local".into();
+        recorder.finish(format!("ok (local {})", reply.kind));
+        return local_response(&requested, &reply.text, wants_stream);
+    }
     let targets = match router::resolve(&config, &requested) {
         Ok(targets) => targets,
         Err(err) => {
@@ -635,6 +650,21 @@ async fn messages(State(state): State<AppState>, headers: HeaderMap, body: Bytes
     });
     recorder.finish(format!("error: {err}"));
     anthropic_error(err.status, &err.message)
+}
+
+/// A complete Anthropic reply made of one text block, without a provider.
+fn local_response(model: &str, text: &str, stream: bool) -> Response {
+    let mut encoder = AnthropicEncoder::new(model, 0);
+    let mut frames = encoder.start();
+    frames.extend(encoder.push(Event::Text(text.to_string())));
+    frames.extend(encoder.push(Event::Finish(Finish::Stop)));
+    if stream {
+        return sse_response(futures_util::stream::iter(frames));
+    }
+    match anthropic::aggregate(&frames) {
+        Ok(message) => Json(message).into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, Json(error)).into_response(),
+    }
 }
 
 fn passthrough(response: reqwest::Response, recorder: Recorder) -> Response {
