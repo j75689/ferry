@@ -27,6 +27,10 @@ on Windows). The ACP server runs the `PreToolUse` hooks that other tools
 install there, and a hook that answers `{}` instead of an explicit decision
 denies every call. Remove that hook, or have it answer `{"decision": "ask"}`.
 
+The ACP server can get stuck failing every session with `Internal error
+(code -32603)`. Ferry retries such a failure once, then restarts the server
+and tries again; the error it reports includes the server's details.
+
 Caveats: this uses the agent as a model, which Google does not document as a
 supported use. Review Google's terms before relying on it. The server
 reports no reasoning details for tool turns, adds its own instructions on

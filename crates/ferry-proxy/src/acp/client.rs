@@ -21,12 +21,55 @@ pub const AUTH_REQUIRED: i64 = -32000;
 pub struct RpcError {
     pub code: i64,
     pub message: String,
+    /// The error's `data`, which often holds the agent's real reason.
+    pub data: Option<String>,
+}
+
+/// JSON-RPC "internal error", what the agent reports for its own failures.
+pub const INTERNAL_ERROR: i64 = -32603;
+const MAX_DATA_CHARS: usize = 500;
+
+impl RpcError {
+    fn local(code: i64, message: impl Into<String>) -> Self {
+        RpcError {
+            code,
+            message: message.into(),
+            data: None,
+        }
+    }
+
+    /// Whether the agent process itself failed (it errored internally, timed
+    /// out, or exited), so a fresh process may succeed.
+    pub fn is_agent_failure(&self) -> bool {
+        matches!(self.code, INTERNAL_ERROR | -32098 | -32099)
+    }
 }
 
 impl std::fmt::Display for RpcError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} (code {})", self.message, self.code)
+        write!(f, "{} (code {})", self.message, self.code)?;
+        match &self.data {
+            Some(data) => write!(f, ": {data}"),
+            None => Ok(()),
+        }
     }
+}
+
+fn error_data(data: Option<&Value>) -> Option<String> {
+    let text = match data? {
+        Value::Null => return None,
+        Value::String(text) => text.clone(),
+        other => other.to_string(),
+    };
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let mut short: String = text.chars().take(MAX_DATA_CHARS).collect();
+    if short.len() < text.len() {
+        short.push('…');
+    }
+    Some(short)
 }
 
 type Pending = Mutex<HashMap<u64, oneshot::Sender<Result<Value, RpcError>>>>;
@@ -93,10 +136,7 @@ impl Connection {
                 }
                 alive.store(false, Ordering::SeqCst);
                 for (_, waiter) in pending.lock().unwrap().drain() {
-                    let _ = waiter.send(Err(RpcError {
-                        code: -32099,
-                        message: "agent process exited".into(),
-                    }));
+                    let _ = waiter.send(Err(RpcError::local(-32099, "agent process exited")));
                 }
                 sessions.lock().unwrap().clear();
             }
@@ -172,23 +212,20 @@ impl Connection {
         let message = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
         if let Err(err) = self.write_line(&message.to_string()).await {
             self.pending.lock().unwrap().remove(&id);
-            return Err(RpcError {
-                code: -32099,
-                message: format!("cannot write to agent: {err}"),
-            });
+            return Err(RpcError::local(
+                -32099,
+                format!("cannot write to agent: {err}"),
+            ));
         }
         match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(result)) => result,
-            Ok(Err(_)) => Err(RpcError {
-                code: -32099,
-                message: "agent process exited".into(),
-            }),
+            Ok(Err(_)) => Err(RpcError::local(-32099, "agent process exited")),
             Err(_) => {
                 self.pending.lock().unwrap().remove(&id);
-                Err(RpcError {
-                    code: -32098,
-                    message: format!("{method} timed out after {}s", timeout.as_secs()),
-                })
+                Err(RpcError::local(
+                    -32098,
+                    format!("{method} timed out after {}s", timeout.as_secs()),
+                ))
             }
         }
     }
@@ -256,11 +293,12 @@ fn dispatch(
             };
             let result = match message.get("error") {
                 Some(error) => Err(RpcError {
-                    code: error["code"].as_i64().unwrap_or(-32603),
+                    code: error["code"].as_i64().unwrap_or(INTERNAL_ERROR),
                     message: error["message"]
                         .as_str()
                         .unwrap_or("agent error")
                         .to_string(),
+                    data: error_data(error.get("data")),
                 }),
                 None => Ok(message.get("result").cloned().unwrap_or(Value::Null)),
             };

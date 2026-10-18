@@ -97,6 +97,18 @@ impl AcpManager {
         }
     }
 
+    /// Shut down `broken` if it is still the current agent process, so the
+    /// next request starts a fresh one.
+    pub async fn discard(&self, broken: &Arc<Connection>) {
+        let mut slot = self.connection.lock().await;
+        if slot.as_ref().is_some_and(|c| Arc::ptr_eq(c, broken)) {
+            tracing::warn!("restarting the Antigravity agent");
+            if let Some(connection) = slot.take() {
+                connection.shutdown().await;
+            }
+        }
+    }
+
     pub async fn stop(&self) {
         if let Some(connection) = self.connection.lock().await.take() {
             connection.shutdown().await;

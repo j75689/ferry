@@ -21,6 +21,10 @@ const SESSION_TIMEOUT: Duration = Duration::from_secs(60);
 const PROMPT_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// After the first tool call, wait this long for parallel calls before ending the turn.
 const TOOL_BATCH_WINDOW: Duration = Duration::from_millis(1500);
+/// Wait before retrying a session the agent failed to start.
+const RETRY_DELAY: Duration = Duration::from_secs(1);
+/// Session attempts: one retry on the same process, then one on a new one.
+const SESSION_ATTEMPTS: u32 = 3;
 
 const INSTRUCTIONS: &str = "You are the language model behind a coding assistant that runs on the user's machine.
 The assistant's tools are available to you through the MCP server named \"ferry\".
@@ -250,11 +254,63 @@ enum Incoming {
     BatchClosed,
 }
 
+/// Why a session could not be opened, and the agent process to blame when
+/// the agent itself failed.
+struct Failure {
+    error: UpstreamError,
+    broken: Option<Arc<Connection>>,
+}
+
+impl From<UpstreamError> for Failure {
+    fn from(error: UpstreamError) -> Self {
+        Failure {
+            error,
+            broken: None,
+        }
+    }
+}
+
+fn agent_failure(connection: &Arc<Connection>, err: &RpcError) -> Failure {
+    Failure {
+        error: rpc_failure(err),
+        broken: err.is_agent_failure().then(|| connection.clone()),
+    }
+}
+
+/// Open a session and stream its turn. The agent process can get into a
+/// state where it fails every session with an internal error; when a retry
+/// on it fails too, it is restarted.
 pub async fn open(
     manager: &AcpManager,
     model: &str,
     request: &Value,
 ) -> Result<EventStream, UpstreamError> {
+    let mut attempt = 1;
+    loop {
+        match open_once(manager, model, request).await {
+            Ok(stream) => return Ok(stream),
+            Err(Failure {
+                error,
+                broken: Some(connection),
+            }) if attempt < SESSION_ATTEMPTS => {
+                tracing::warn!(%error, attempt, "the Antigravity agent failed to start a session");
+                if attempt == 1 {
+                    tokio::time::sleep(RETRY_DELAY).await;
+                } else {
+                    manager.discard(&connection).await;
+                }
+                attempt += 1;
+            }
+            Err(failure) => return Err(failure.error),
+        }
+    }
+}
+
+async fn open_once(
+    manager: &AcpManager,
+    model: &str,
+    request: &Value,
+) -> Result<EventStream, Failure> {
     let connection = manager
         .connection()
         .await
@@ -271,7 +327,8 @@ pub async fn open(
             return Err(error(
                 502,
                 "antigravity: this ACP server version cannot reach HTTP MCP servers",
-            ));
+            )
+            .into());
         }
         mcp_servers.push(json!({
             "type": "http",
@@ -294,7 +351,7 @@ pub async fn open(
     let session = connection
         .request("session/new", params, SESSION_TIMEOUT)
         .await
-        .map_err(|e| rpc_failure(&e))?;
+        .map_err(|e| agent_failure(&connection, &e))?;
     let session_id = session["sessionId"]
         .as_str()
         .ok_or_else(|| error(502, "antigravity: session/new returned no sessionId"))?
@@ -421,11 +478,11 @@ pub async fn open(
 }
 
 async fn select_model(
-    connection: &Connection,
+    connection: &Arc<Connection>,
     session: &Value,
     session_id: &str,
     model: &str,
-) -> Result<(), UpstreamError> {
+) -> Result<(), Failure> {
     let (config_id, models) = model_options(session);
     if model.is_empty() || model == "default" || models.is_empty() {
         return Ok(());
@@ -441,7 +498,8 @@ async fn select_model(
                 "antigravity: unknown model {model:?}; available: {}",
                 known.join(", ")
             ),
-        ));
+        )
+        .into());
     };
     let (method, params) = match config_id {
         Some(config_id) => (
@@ -457,7 +515,7 @@ async fn select_model(
         .request(method, params, SESSION_TIMEOUT)
         .await
         .map(|_| ())
-        .map_err(|e| rpc_failure(&e))
+        .map_err(|e| agent_failure(connection, &e))
 }
 
 fn update_event(update: &Value) -> Option<Event> {

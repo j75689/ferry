@@ -7,6 +7,9 @@
 //! `RUN_TOOL` it calls the client's shell tool through the session's HTTP
 //! MCP server, the way the real agent uses client-provided tools. Like the
 //! real agent, it asks the client for permission before each tool call.
+//! Creating the file named by `$MOCK_ACP_WEDGE` makes the running process
+//! fail every new session until it is restarted, as the real one sometimes
+//! does.
 
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
@@ -150,6 +153,7 @@ async fn main() {
         }
     });
     let mut next_session = 0;
+    let mut wedged = false;
     while let Some(message) = rx.recv().await {
         let id = message["id"].clone();
         let params = message["params"].clone();
@@ -181,6 +185,17 @@ async fn main() {
                 send(&out, reply(json!({})));
             }
             "session/new" => {
+                if let Some(wedge) = std::env::var_os("MOCK_ACP_WEDGE") {
+                    wedged |= std::fs::remove_file(wedge).is_ok();
+                }
+                if wedged {
+                    send(
+                        &out,
+                        json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32603, "message": "Internal error",
+                               "data": {"details": "mock agent is wedged"}}}),
+                    );
+                    continue;
+                }
                 if !state_file().exists() {
                     send(
                         &out,

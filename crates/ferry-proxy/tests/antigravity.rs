@@ -104,6 +104,8 @@ async fn install_sign_in_and_serve_both_clients() {
     let scratch = std::env::temp_dir().join(ferry_proxy::stream::new_id("ferry-acp-test-"));
     std::fs::create_dir_all(&scratch).unwrap();
     std::env::set_var("MOCK_ACP_STATE", scratch.join("signed-in"));
+    let wedge = scratch.join("wedge");
+    std::env::set_var("MOCK_ACP_WEDGE", &wedge);
     std::env::set_var("FERRY_ACP_REGISTRY_URL", start_registry("1.0.0").await);
 
     let config = Config::from_toml(&format!(
@@ -219,6 +221,18 @@ async fn install_sign_in_and_serve_both_clients() {
             .contains("gemini-mock-pro"),
         "{body}"
     );
+
+    // An agent stuck failing every session is restarted, and the request
+    // still succeeds.
+    std::fs::write(&wedge, "").unwrap();
+    let frames = post_sse(
+        &format!("{gateway}/v1/responses"),
+        json!({"model": "antigravity/gemini-mock-pro", "stream": true,
+               "input": [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}]}),
+    )
+    .await;
+    assert!(!wedge.exists(), "the agent saw the wedge");
+    assert_eq!(text(&frames), "Hello from gemini-mock-pro via ACP.");
 
     // Update: a newer registry version replaces the old install.
     std::env::set_var("FERRY_ACP_REGISTRY_URL", start_registry("1.1.0").await);
