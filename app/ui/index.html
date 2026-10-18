@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ferry</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo" aria-hidden="true">&gt;_</span>
+      <div>
+        <h1>Ferry</h1>
+        <p class="sub">讓 Claude Code / Codex 使用任何模型</p>
+      </div>
+    </div>
+    <div class="status" id="status">
+      <span class="dot" id="status-dot"></span>
+      <span id="status-text">啟動中…</span>
+      <button class="ghost small" id="copy-url" title="複製網址">複製</button>
+    </div>
+  </header>
+
+  <div id="banner" class="banner hidden"></div>
+
+  <nav class="tabs" role="tablist">
+    <button role="tab" data-tab="models" class="active">模型</button>
+    <button role="tab" data-tab="providers">Providers</button>
+    <button role="tab" data-tab="usage">使用方式</button>
+    <button role="tab" data-tab="requests">請求紀錄</button>
+    <button role="tab" data-tab="settings">設定</button>
+  </nav>
+
+  <main>
+    <section id="tab-models" class="panel active">
+      <div class="card">
+        <h2>模型路由</h2>
+        <p class="hint">模型格式為 <code>provider_id/模型名稱</code>。Claude Code 送來 opus / sonnet / haiku 時會依下面的對應挑選；沒有設定的會用「預設模型」。</p>
+        <div class="grid">
+          <label>預設模型 <span class="req">*</span>
+            <input list="model-options" id="m-default" placeholder="例如 nim/meta/llama-3.3-70b-instruct">
+          </label>
+          <label>Opus 對應
+            <input list="model-options" id="m-opus" placeholder="留空 = 預設模型">
+          </label>
+          <label>Sonnet 對應
+            <input list="model-options" id="m-sonnet" placeholder="留空 = 預設模型">
+          </label>
+          <label>Haiku 對應（背景小任務）
+            <input list="model-options" id="m-haiku" placeholder="建議填快速、便宜的模型">
+          </label>
+        </div>
+        <label>Fallback 順序（每行一個；主要模型失敗時依序嘗試）
+          <textarea id="m-fallbacks" rows="3" placeholder="groq/openai/gpt-oss-120b"></textarea>
+        </label>
+        <datalist id="model-options"></datalist>
+        <div class="actions">
+          <button class="primary" data-save>儲存</button>
+        </div>
+      </div>
+    </section>
+
+    <section id="tab-providers" class="panel">
+      <div class="split">
+        <div class="card list-card">
+          <div class="row-between">
+            <h2>Providers</h2>
+          </div>
+          <ul id="provider-list" class="provider-list"></ul>
+          <div class="add-row">
+            <select id="preset-select" aria-label="選擇範本"></select>
+            <button class="primary small" id="add-provider">新增</button>
+          </div>
+        </div>
+        <div class="card" id="provider-editor">
+          <p class="empty">從左側選擇或新增一個 provider。</p>
+        </div>
+      </div>
+    </section>
+
+    <section id="tab-usage" class="panel">
+      <div class="card">
+        <h2>方法一：<code>ferry</code> 命令列（推薦）</h2>
+        <div class="row-between">
+          <p class="hint">安裝 <code>ferry</code> 後，直接用它啟動原生工具，所有參數會原樣傳下去：</p>
+          <button class="ghost small" id="install-cli">安裝命令列工具</button>
+        </div>
+        <pre class="code"><code>ferry claude          # Claude Code
+ferry codex           # Codex
+ferry codex exec "fix the tests"</code></pre>
+      </div>
+      <div class="card">
+        <div class="row-between"><h2>方法二：手動設定 Claude Code</h2><button class="ghost small" data-copy="claude-env">複製</button></div>
+        <pre class="code"><code id="claude-env"></code></pre>
+      </div>
+      <div class="card">
+        <div class="row-between"><h2>方法三：手動設定 Codex（~/.codex/config.toml）</h2><button class="ghost small" data-copy="codex-env">複製</button></div>
+        <pre class="code"><code id="codex-env"></code></pre>
+      </div>
+    </section>
+
+    <section id="tab-requests" class="panel">
+      <div class="card">
+        <div class="row-between">
+          <h2>最近的請求</h2>
+          <span class="hint" id="req-count"></span>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>時間</th><th>API</th><th>要求的模型</th><th>實際路由</th><th>結果</th><th>耗時</th><th>Tokens（入/出）</th></tr></thead>
+            <tbody id="req-body"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <section id="tab-settings" class="panel">
+      <div class="card">
+        <h2>Gateway</h2>
+        <div class="grid">
+          <label>監聽位址
+            <input id="s-host">
+          </label>
+          <label>Port
+            <input id="s-port" type="number" min="1" max="65535">
+          </label>
+          <label>首位元組逾時（秒）
+            <input id="s-timeout" type="number" min="5">
+          </label>
+          <label>可重試錯誤的重試次數
+            <input id="s-retries" type="number" min="0" max="10">
+          </label>
+        </div>
+        <label>存取 Token（Claude Code / Codex 用它連到 Ferry，不是 provider 的 key）
+          <div class="inline">
+            <input id="s-token" class="mono">
+            <button class="ghost small" id="regen-token">重新產生</button>
+          </div>
+        </label>
+        <p class="hint">設定檔：<code id="config-path"></code></p>
+        <div class="actions">
+          <button class="ghost" id="restart">重新啟動 gateway</button>
+          <button class="primary" data-save>儲存</button>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <div id="toast" class="toast hidden" role="status"></div>
+  <script src="app.js"></script>
+</body>
+</html>

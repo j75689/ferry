@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = ["crates/ferry-proxy", "crates/ferry-cli", "app/src-tauri"]
+# The desktop app needs system WebView libraries; plain `cargo build/test`
+# only builds the proxy and CLI.
+default-members = ["crates/ferry-proxy", "crates/ferry-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+rust-version = "1.80"
+
+[workspace.dependencies]
+ferry-proxy = { path = "crates/ferry-proxy" }
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
