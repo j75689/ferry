@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-theme="dark">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -7,156 +7,216 @@
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
-  <header class="topbar">
-    <div class="brand">
-      <span class="logo" aria-hidden="true">&gt;_</span>
-      <div>
-        <h1>Ferry</h1>
-        <p class="sub">Run Claude Code and Codex on any model</p>
-      </div>
-    </div>
-    <div class="status" id="status">
-      <span class="dot" id="status-dot"></span>
-      <span id="status-text">Starting…</span>
-      <button class="ghost small" id="copy-url" title="Copy the gateway URL">Copy</button>
-    </div>
-  </header>
-
-  <div id="banner" class="banner hidden"></div>
-
-  <nav class="tabs" role="tablist">
-    <button role="tab" data-tab="models" class="active">Models</button>
-    <button role="tab" data-tab="providers">Providers</button>
-    <button role="tab" data-tab="usage">Usage</button>
-    <button role="tab" data-tab="requests">Requests</button>
-    <button role="tab" data-tab="settings">Settings</button>
-  </nav>
-
-  <main>
-    <section id="tab-models" class="panel active">
-      <div class="card">
-        <h2>Model routing</h2>
-        <p class="hint">Models are written <code>provider_id/model_name</code>. When Claude Code asks for opus, sonnet, or haiku, the mapping below is used; anything unmapped goes to the default model.</p>
-        <div class="grid">
-          <label>Default model <span class="req">*</span>
-            <input list="model-options" id="m-default" placeholder="e.g. nim/meta/llama-3.3-70b-instruct">
-          </label>
-          <label>Opus maps to
-            <input list="model-options" id="m-opus" placeholder="Empty = default model">
-          </label>
-          <label>Sonnet maps to
-            <input list="model-options" id="m-sonnet" placeholder="Empty = default model">
-          </label>
-          <label>Haiku maps to (small background tasks)
-            <input list="model-options" id="m-haiku" placeholder="A fast, cheap model works best">
-          </label>
-        </div>
-        <label>Fallback order (one per line; tried in order when the primary model fails)
-          <textarea id="m-fallbacks" rows="3" placeholder="groq/openai/gpt-oss-120b"></textarea>
-        </label>
-        <datalist id="model-options"></datalist>
-        <div class="actions">
-          <button class="primary" data-save>Save</button>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <div class="app">
+    <aside class="sidebar">
+      <div class="brand">
+        <svg class="logo" viewBox="0 0 32 32" aria-hidden="true" focusable="false">
+          <rect width="32" height="32" rx="8"/>
+          <path d="M9 11l5 5-5 5M17 21h7" fill="none" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+        <div>
+          <p class="brand-name">Ferry</p>
+          <p class="brand-sub">Gateway for Claude Code and Codex</p>
         </div>
       </div>
-    </section>
 
-    <section id="tab-providers" class="panel">
-      <div class="split">
-        <div class="card list-card">
-          <div class="row-between">
-            <h2>Providers</h2>
+      <nav aria-label="Sections">
+        <ul class="nav">
+          <li><a href="#models" data-page="models" data-icon="sliders-horizontal">Models</a></li>
+          <li><a href="#providers" data-page="providers" data-icon="plugs-connected">Providers</a></li>
+          <li><a href="#usage" data-page="usage" data-icon="terminal-window">Usage</a></li>
+          <li><a href="#requests" data-page="requests" data-icon="clock-counter-clockwise">Requests</a></li>
+          <li><a href="#settings" data-page="settings" data-icon="gear-six">Settings</a></li>
+        </ul>
+      </nav>
+
+      <div class="status-card" id="status">
+        <p class="status-line"><span id="status-icon" class="status-icon"></span><span id="status-text" role="status">Starting…</span></p>
+        <div class="status-url">
+          <code id="status-url"></code>
+          <button class="icon-button" id="copy-url" type="button" aria-label="Copy the gateway URL" data-icon="copy"></button>
+        </div>
+      </div>
+    </aside>
+
+    <main id="main" tabindex="-1">
+      <div id="banner" class="banner hidden" role="alert"></div>
+
+      <section id="page-models" class="page" aria-labelledby="h-models">
+        <header class="page-head">
+          <h1 id="h-models" tabindex="-1">Models</h1>
+          <p class="lede">Choose which provider model answers each kind of request.</p>
+        </header>
+        <div class="card">
+          <h2>Routing</h2>
+          <p class="hint">Write models as <code>provider_id/model_name</code>. When Claude Code asks for opus, sonnet, or haiku, the mapping below is used; anything unmapped goes to the default model.</p>
+          <div class="grid">
+            <div class="field">
+              <label for="m-default">Default model <span class="req" aria-hidden="true">*</span></label>
+              <input id="m-default" list="model-options" required aria-describedby="m-default-help m-default-error" class="mono">
+              <p class="help" id="m-default-help">Used for every request without a more specific match.</p>
+              <p class="error" id="m-default-error"></p>
+            </div>
+            <div class="field">
+              <label for="m-haiku">Haiku maps to</label>
+              <input id="m-haiku" list="model-options" aria-describedby="m-haiku-help m-haiku-error" class="mono">
+              <p class="help" id="m-haiku-help">Small background tasks. A fast, cheap model works best.</p>
+              <p class="error" id="m-haiku-error"></p>
+            </div>
+            <div class="field">
+              <label for="m-sonnet">Sonnet maps to</label>
+              <input id="m-sonnet" list="model-options" aria-describedby="m-sonnet-help m-sonnet-error" class="mono">
+              <p class="help" id="m-sonnet-help">Leave empty to use the default model.</p>
+              <p class="error" id="m-sonnet-error"></p>
+            </div>
+            <div class="field">
+              <label for="m-opus">Opus maps to</label>
+              <input id="m-opus" list="model-options" aria-describedby="m-opus-help m-opus-error" class="mono">
+              <p class="help" id="m-opus-help">Leave empty to use the default model.</p>
+              <p class="error" id="m-opus-error"></p>
+            </div>
           </div>
-          <ul id="provider-list" class="provider-list"></ul>
-          <div class="add-row">
-            <select id="preset-select" aria-label="Provider template"></select>
-            <button class="primary small" id="add-provider">Add</button>
+          <div class="field">
+            <label for="m-fallbacks">Fallback order</label>
+            <textarea id="m-fallbacks" rows="3" aria-describedby="m-fallbacks-help m-fallbacks-error" class="mono"></textarea>
+            <p class="help" id="m-fallbacks-help">One model per line. Tried in order when the primary model fails, including after a stream breaks.</p>
+            <p class="error" id="m-fallbacks-error"></p>
+          </div>
+          <datalist id="model-options"></datalist>
+          <div class="actions">
+            <button class="button primary" type="button" data-save>Save</button>
           </div>
         </div>
-        <div class="card" id="provider-editor">
-          <p class="empty">Select a provider on the left, or add one.</p>
-        </div>
-      </div>
-    </section>
+      </section>
 
-    <section id="tab-usage" class="panel">
-      <div class="card">
-        <h2>Option 1: the <code>ferry</code> command (recommended)</h2>
-        <div class="row-between">
-          <p class="hint">Once <code>ferry</code> is installed, use it to start the native tools. Every argument is passed through:</p>
-          <button class="ghost small" id="install-cli">Install CLI</button>
+      <section id="page-providers" class="page" aria-labelledby="h-providers" hidden>
+        <header class="page-head">
+          <h1 id="h-providers" tabindex="-1">Providers</h1>
+          <p class="lede">Where requests are sent. Each provider ID becomes the prefix of its model names.</p>
+        </header>
+        <div class="split">
+          <div class="card list-card">
+            <h2>Configured</h2>
+            <ul id="provider-list" class="provider-list"></ul>
+            <div class="field add-field">
+              <label for="preset-select">Add from template</label>
+              <select id="preset-select"></select>
+              <button class="button primary" id="add-provider" type="button" data-icon="plus">Add provider</button>
+            </div>
+          </div>
+          <div class="card" id="provider-editor"></div>
         </div>
-        <pre class="code"><code>ferry claude          # Claude Code
+      </section>
+
+      <section id="page-usage" class="page" aria-labelledby="h-usage" hidden>
+        <header class="page-head">
+          <h1 id="h-usage" tabindex="-1">Usage</h1>
+          <p class="lede">Start the native tools through Ferry, or point them at it yourself.</p>
+        </header>
+        <div class="card">
+          <div class="card-head">
+            <h2>The <code>ferry</code> command <span class="tag">Recommended</span></h2>
+            <button class="button" id="install-cli" type="button" data-icon="download-simple">Install CLI</button>
+          </div>
+          <p class="hint">Every argument is passed through to the tool.</p>
+          <pre class="code"><code>ferry claude          # Claude Code
 ferry codex           # Codex
 ferry codex exec "fix the tests"</code></pre>
-      </div>
-      <div class="card">
-        <div class="row-between"><h2>Option 2: configure Claude Code by hand</h2><button class="ghost small" data-copy="claude-env">Copy</button></div>
-        <pre class="code"><code id="claude-env"></code></pre>
-      </div>
-      <div class="card">
-        <div class="row-between"><h2>Option 3: configure Codex by hand (~/.codex/config.toml)</h2><button class="ghost small" data-copy="codex-env">Copy</button></div>
-        <pre class="code"><code id="codex-env"></code></pre>
-      </div>
-    </section>
-
-    <section id="tab-requests" class="panel">
-      <div class="card">
-        <div class="row-between">
-          <h2>Recent requests</h2>
-          <span class="hint" id="req-count"></span>
         </div>
-        <div class="table-wrap">
-          <table>
-            <thead><tr><th>Time</th><th>API</th><th>Requested model</th><th>Routed to</th><th>Outcome</th><th>Duration</th><th>Tokens (in / out)</th></tr></thead>
-            <tbody id="req-body"></tbody>
-          </table>
-        </div>
-      </div>
-    </section>
-
-    <section id="tab-settings" class="panel">
-      <div class="card">
-        <h2>Gateway</h2>
-        <div class="grid">
-          <label>Listen address
-            <input id="s-host">
-          </label>
-          <label>Port
-            <input id="s-port" type="number" min="1" max="65535">
-          </label>
-          <label>First-byte timeout (seconds)
-            <input id="s-timeout" type="number" min="5">
-          </label>
-          <label>Retries for retryable errors
-            <input id="s-retries" type="number" min="0" max="10">
-          </label>
-        </div>
-        <label>Access token (what Claude Code / Codex send to Ferry; not a provider key)
-          <div class="inline">
-            <input id="s-token" class="mono">
-            <button class="ghost small" id="regen-token">Regenerate</button>
+        <div class="card">
+          <div class="card-head">
+            <h2>Claude Code by hand</h2>
+            <button class="button" type="button" data-copy="claude-env" data-icon="copy">Copy</button>
           </div>
-        </label>
-        <p class="hint">Config file: <code id="config-path"></code></p>
-        <div class="actions">
-          <button class="ghost" id="restart">Restart gateway</button>
-          <button class="primary" data-save>Save</button>
+          <pre class="code"><code id="claude-env"></code></pre>
         </div>
-      </div>
-      <div class="card">
-        <h2>Local shortcuts</h2>
-        <p class="hint">Requests Ferry answers itself, saving provider calls and rate limits.</p>
-        <label class="check"><input type="checkbox" id="o-titles"> Name Claude Code sessions locally (saves one model call per turn)</label>
-        <label class="check"><input type="checkbox" id="o-quota"> Answer quota probes from older Claude Code versions</label>
-        <div class="actions">
-          <button class="primary" data-save>Save</button>
+        <div class="card">
+          <div class="card-head">
+            <h2>Codex by hand <span class="hint-inline">~/.codex/config.toml</span></h2>
+            <button class="button" type="button" data-copy="codex-env" data-icon="copy">Copy</button>
+          </div>
+          <pre class="code"><code id="codex-env"></code></pre>
         </div>
-      </div>
-    </section>
-  </main>
+      </section>
 
-  <div id="toast" class="toast hidden" role="status"></div>
+      <section id="page-requests" class="page" aria-labelledby="h-requests" hidden>
+        <header class="page-head">
+          <h1 id="h-requests" tabindex="-1">Requests</h1>
+          <p class="lede">The latest requests through this gateway, newest first. <span id="req-count"></span></p>
+        </header>
+        <div class="card list-panel">
+          <ol id="req-list" class="request-list"></ol>
+        </div>
+      </section>
+
+      <section id="page-settings" class="page" aria-labelledby="h-settings" hidden>
+        <header class="page-head">
+          <h1 id="h-settings" tabindex="-1">Settings</h1>
+          <p class="lede">Gateway network settings, local shortcuts, and appearance.</p>
+        </header>
+        <div class="card">
+          <h2>Gateway</h2>
+          <div class="grid">
+            <div class="field">
+              <label for="s-host">Listen address</label>
+              <input id="s-host" class="mono" aria-describedby="s-host-help">
+              <p class="help" id="s-host-help">127.0.0.1 keeps the gateway private to this machine.</p>
+            </div>
+            <div class="field">
+              <label for="s-port">Port</label>
+              <input id="s-port" type="number" min="1" max="65535" class="mono" aria-describedby="s-port-error">
+              <p class="error" id="s-port-error"></p>
+            </div>
+            <div class="field">
+              <label for="s-timeout">First-byte timeout (seconds)</label>
+              <input id="s-timeout" type="number" min="5" class="mono">
+            </div>
+            <div class="field">
+              <label for="s-retries">Retries for retryable errors</label>
+              <input id="s-retries" type="number" min="0" max="10" class="mono">
+            </div>
+          </div>
+          <div class="field">
+            <label for="s-token">Access token</label>
+            <div class="inline">
+              <input id="s-token" class="mono" autocomplete="off" aria-describedby="s-token-help">
+              <button class="button" id="regen-token" type="button" data-icon="arrow-clockwise">Regenerate</button>
+            </div>
+            <p class="help" id="s-token-help">What Claude Code and Codex send to Ferry. Not a provider key.</p>
+          </div>
+          <p class="hint">Config file: <code id="config-path"></code></p>
+          <div class="actions">
+            <button class="button" id="restart" type="button" data-icon="arrow-clockwise">Restart gateway</button>
+            <button class="button primary" type="button" data-save>Save</button>
+          </div>
+        </div>
+        <div class="card">
+          <h2>Local shortcuts</h2>
+          <p class="hint">Requests Ferry answers itself, saving provider calls and rate limits.</p>
+          <label class="check"><input type="checkbox" id="o-titles"> Name Claude Code sessions locally <span class="hint-inline">saves one model call per turn</span></label>
+          <label class="check"><input type="checkbox" id="o-quota"> Answer quota probes from older Claude Code versions</label>
+          <div class="actions">
+            <button class="button primary" type="button" data-save>Save</button>
+          </div>
+        </div>
+        <div class="card">
+          <h2>Appearance</h2>
+          <div class="field narrow">
+            <label for="theme">Theme</label>
+            <select id="theme">
+              <option value="dark">Dark</option>
+              <option value="light">Light</option>
+              <option value="system">Match the system</option>
+            </select>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
+  <script src="icons.js"></script>
   <script src="app.js"></script>
 </body>
 </html>
