@@ -271,6 +271,8 @@ struct Recorder {
     record: RequestRecord,
     started: Instant,
     done: bool,
+    /// Extra detail for the outcome, such as an auto-mode review verdict.
+    note: Option<String>,
     /// Targets a broken stream was resumed on, filled in by [`resumable_events`].
     resumed_on: Arc<Mutex<Vec<String>>>,
 }
@@ -295,6 +297,7 @@ impl Recorder {
             },
             started: Instant::now(),
             done: false,
+            note: None,
             resumed_on: Arc::default(),
         }
     }
@@ -322,7 +325,10 @@ impl Recorder {
 
     fn finish(&mut self, outcome: String) {
         if !self.done {
-            self.record.outcome = outcome;
+            self.record.outcome = match &self.note {
+                Some(note) => format!("{outcome} ({note})"),
+                None => outcome,
+            };
         }
         self.done = true;
     }
@@ -550,6 +556,7 @@ async fn messages(State(state): State<AppState>, headers: HeaderMap, body: Bytes
         .unwrap_or("")
         .to_string();
     let wants_stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    let verdict_fixer = review::VerdictFixer::for_request(&body);
     let api = if review::prepare(&mut body) {
         "messages (auto-mode review)"
     } else {
@@ -610,8 +617,21 @@ async fn messages(State(state): State<AppState>, headers: HeaderMap, body: Bytes
                                 Some(anthropic::to_chat_request(&source, &t.model, &t.provider))
                             }),
                         };
+                        let mut fixer = verdict_fixer;
                         let events =
-                            resumable_events(resume, index, response, recorder.resumed_on.clone());
+                            resumable_events(resume, index, response, recorder.resumed_on.clone())
+                                .flat_map(move |event| {
+                                    let events = match fixer.as_mut() {
+                                        Some(fixer) => {
+                                            let events = fixer.push(event);
+                                            let note =
+                                                fixer.outcome.map(|o| format!("verdict: {o}"));
+                                            events.into_iter().map(|e| (e, note.clone())).collect()
+                                        }
+                                        None => vec![(event, None)],
+                                    };
+                                    futures_util::stream::iter(events)
+                                });
                         if wants_stream {
                             let frames = async_stream::stream! {
                                 let mut recorder = recorder;
@@ -619,7 +639,8 @@ async fn messages(State(state): State<AppState>, headers: HeaderMap, body: Bytes
                                 for frame in encoder.start() {
                                     yield frame;
                                 }
-                                while let Some(event) = events.next().await {
+                                while let Some((event, note)) = events.next().await {
+                                    recorder.note = note;
                                     recorder.observe(&event);
                                     for frame in encoder.push(event) {
                                         yield frame;
@@ -633,7 +654,8 @@ async fn messages(State(state): State<AppState>, headers: HeaderMap, body: Bytes
                         }
                         let mut frames = encoder.start();
                         let mut events = std::pin::pin!(events);
-                        while let Some(event) = events.next().await {
+                        while let Some((event, note)) = events.next().await {
+                            recorder.note = note;
                             recorder.observe(&event);
                             frames.extend(encoder.push(event));
                         }

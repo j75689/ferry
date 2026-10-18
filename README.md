@@ -39,7 +39,10 @@ codex ──model_providers.ferry──▶ │  /v1/responses (Codex)   │     
   outside the project) before running them, and blocks the action when the
   reply holds no verdict. Ferry gives these review requests enough output
   tokens for reasoning models and drops the verdict stop sequence some
-  providers reject. `ferry claude` also sets `CLAUDE_CODE_AUTO_MODE_SERVER=0`,
+  providers reject. When a model states the verdict another way
+  (`shouldBlock: false`, `Block: no`) or only in its reasoning, Ferry adds
+  the tag it meant; the Requests page shows each review's verdict.
+  `ferry claude` also sets `CLAUDE_CODE_AUTO_MODE_SERVER=0`,
   because the server-side review only exists on Anthropic's API. A weak model
   can still block actions it should allow; map `sonnet` (which the review
   uses) to a capable model, or leave auto mode with Shift+Tab.
