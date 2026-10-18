@@ -9,6 +9,7 @@ pub mod local;
 pub mod presets;
 pub mod recovery;
 pub mod responses;
+pub mod review;
 pub mod router;
 pub mod server;
 pub mod stream;

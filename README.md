@@ -35,6 +35,14 @@ codex ──model_providers.ferry──▶ │  /v1/responses (Codex)   │     
   the model for a session title on every turn, and Ferry replies itself
   instead (a quota probe from older versions is handled the same way). Both
   can be switched off under `[optimizations]` or in the app's Settings.
+* Claude Code's auto mode has the model review risky actions (Bash, writes
+  outside the project) before running them, and blocks the action when the
+  reply holds no verdict. Ferry gives these review requests enough output
+  tokens for reasoning models and drops the verdict stop sequence some
+  providers reject. `ferry claude` also sets `CLAUDE_CODE_AUTO_MODE_SERVER=0`,
+  because the server-side review only exists on Anthropic's API. A weak model
+  can still block actions it should allow; map `sonnet` (which the review
+  uses) to a capable model, or leave auto mode with Shift+Tab.
 * Every provider kind serves both clients: Claude Code and Codex requests are
   converted to whatever API the target provider speaks.
   Claude Code requests to Anthropic-type providers are passed through as-is.

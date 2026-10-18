@@ -24,6 +24,7 @@ use crate::config::{Config, ProviderKind};
 use crate::local;
 use crate::recovery::{continuation_request, OverlapTrimmer, MAX_RECOVERIES};
 use crate::responses::{self, ResponsesEncoder};
+use crate::review;
 use crate::router::{self, Target};
 use crate::stream::{Event, Finish, Usage};
 use crate::upstream::{self, EventStream, UpstreamError};
@@ -538,7 +539,7 @@ where
 }
 
 async fn messages(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
-    let body = match parse_body(&body) {
+    let mut body = match parse_body(&body) {
         Ok(body) => body,
         Err(message) => return anthropic_error(400, &message),
     };
@@ -549,7 +550,12 @@ async fn messages(State(state): State<AppState>, headers: HeaderMap, body: Bytes
         .unwrap_or("")
         .to_string();
     let wants_stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
-    let mut recorder = Recorder::new(&state, "messages", &requested);
+    let api = if review::prepare(&mut body) {
+        "messages (auto-mode review)"
+    } else {
+        "messages"
+    };
+    let mut recorder = Recorder::new(&state, api, &requested);
     if let Some(reply) = local::answer(&body, &config.optimizations) {
         recorder.record.routed_model = "local".into();
         recorder.finish(format!("ok (local {})", reply.kind));

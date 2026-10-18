@@ -470,6 +470,29 @@ async fn session_titles_are_answered_without_the_provider() {
     assert_eq!(record.routed_model, "local");
 }
 
+#[tokio::test]
+async fn auto_mode_reviews_get_room_for_a_verdict() {
+    let (upstream, fake) = start_fake().await;
+    let (gateway, state) = start_gateway(&upstream, "fake/good").await;
+    post_sse(
+        &format!("{gateway}/v1/messages"),
+        json!({
+            "model": "claude-sonnet-5", "max_tokens": 64, "stream": true,
+            "stop_sequences": ["</block>"], "thinking": {"type": "disabled"},
+            "system": [{"type": "text", "text": "You are a security monitor.\nIf the action should be allowed:\n<block>no</block>"}],
+            "messages": [{"role": "user", "content": "<transcript>\n{\"Bash\":\"touch /tmp/x\"}\n</transcript>"}]
+        }),
+    )
+    .await;
+    let sent = fake.last_body.lock().unwrap().clone();
+    assert_eq!(sent["max_tokens"], ferry_proxy::review::MIN_REVIEW_TOKENS);
+    assert!(sent.get("stop").is_none());
+    assert_eq!(
+        state.recent_requests()[0].api,
+        "messages (auto-mode review)"
+    );
+}
+
 /// An Anthropic-compatible upstream that answers every turn with a shell call.
 async fn anthropic_upstream(seen: Arc<std::sync::Mutex<Value>>) -> String {
     let app = Router::new().route(

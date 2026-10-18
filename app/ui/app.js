@@ -535,8 +535,8 @@ function renderUsage() {
   const c = snapshot.config;
   const url = snapshot.url;
   $("claude-env").textContent =
-    `# macOS / Linux\nexport ANTHROPIC_BASE_URL=${url}\nexport ANTHROPIC_AUTH_TOKEN=${c.server.auth_token}\nunset ANTHROPIC_API_KEY\nclaude\n\n` +
-    `# Windows PowerShell\n$env:ANTHROPIC_BASE_URL="${url}"\n$env:ANTHROPIC_AUTH_TOKEN="${c.server.auth_token}"\nclaude`;
+    `# macOS / Linux\nexport ANTHROPIC_BASE_URL=${url}\nexport ANTHROPIC_AUTH_TOKEN=${c.server.auth_token}\nexport CLAUDE_CODE_AUTO_MODE_SERVER=0\nunset ANTHROPIC_API_KEY\nclaude\n\n` +
+    `# Windows PowerShell\n$env:ANTHROPIC_BASE_URL="${url}"\n$env:ANTHROPIC_AUTH_TOKEN="${c.server.auth_token}"\n$env:CLAUDE_CODE_AUTO_MODE_SERVER="0"\nclaude`;
   $("codex-env").textContent =
     `model_provider = "ferry"\nmodel = ${JSON.stringify(c.models.default || "provider/model")}\n\n` +
     `[model_providers.ferry]\nname = "Ferry"\nbase_url = "${url}/v1"\nwire_api = "responses"\nenv_key = "FERRY_API_KEY"\n\n` +

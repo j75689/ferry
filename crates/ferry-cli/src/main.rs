@@ -188,6 +188,9 @@ fn plan(tool: Tool, url: &str, config: &Config, user_args: Vec<String>) -> Plan 
                 "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY".into(),
                 "1".into(),
             );
+            // Ferry's providers cannot run Anthropic's server-side auto-mode
+            // review, so have Claude Code send its own review requests.
+            set.insert("CLAUDE_CODE_AUTO_MODE_SERVER".into(), "0".into());
             Plan {
                 args: user_args,
                 set,
@@ -304,6 +307,7 @@ async fn print_env(tool: Option<&str>) -> Result<()> {
         "claude" => {
             println!("export ANTHROPIC_BASE_URL={url}");
             println!("export ANTHROPIC_AUTH_TOKEN={token}");
+            println!("export CLAUDE_CODE_AUTO_MODE_SERVER=0");
             println!("unset ANTHROPIC_API_KEY");
         }
         "codex" => {
@@ -368,6 +372,7 @@ mod tests {
         let plan = plan(Tool::Claude, "http://127.0.0.1:9", &config(), vec![]);
         assert_eq!(plan.set["ANTHROPIC_BASE_URL"], "http://127.0.0.1:9");
         assert_eq!(plan.set["ANTHROPIC_AUTH_TOKEN"], "tok");
+        assert_eq!(plan.set["CLAUDE_CODE_AUTO_MODE_SERVER"], "0");
         assert_eq!(plan.remove_prefixes, ["ANTHROPIC_"]);
         let env = child_env(&plan);
         assert!(env
