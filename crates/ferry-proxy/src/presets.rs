@@ -109,6 +109,16 @@ pub const PRESETS: &[Preset] = &[
         reasoning_history: false,
     },
     Preset {
+        id: "antigravity",
+        name: "Google Antigravity (subscription, via ACP)",
+        kind: ProviderKind::Antigravity,
+        base_url: "",
+        key_url: "",
+        example_model: "",
+        max_tokens_cap: None,
+        reasoning_history: false,
+    },
+    Preset {
         id: "ollama",
         name: "Ollama (local)",
         kind: ProviderKind::OpenaiChat,

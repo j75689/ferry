@@ -108,7 +108,7 @@ function renderProviderList() {
     ...draft.providers.map((p, index) =>
       el("li", { class: index === selected ? "active" : "", onclick: () => { selected = index; renderProviders(); } },
         el("span", {}, p.id || "(unnamed)"),
-        el("span", { class: "kind" }, p.kind === "anthropic" ? "Anthropic" : "OpenAI")),
+        el("span", { class: "kind" }, KIND_LABELS[p.kind] || "OpenAI")),
     ),
   );
   if (draft.providers.length === 0) list.append(el("li", { class: "empty" }, "No providers yet"));
@@ -125,11 +125,16 @@ function renderEditor() {
     box.replaceChildren(el("p", { class: "empty" }, "Select a provider on the left, or add one."));
     return;
   }
+  if (p.kind === "antigravity") {
+    renderAntigravity(p, box);
+    return;
+  }
   const preset = snapshot.presets.find((x) => x.id === p.id);
   const update = (key, transform = (v) => v) => (e) => {
     p[key] = transform(e.target.type === "checkbox" ? e.target.checked : e.target.value);
     markDirty();
     if (key === "id" || key === "kind") renderProviderList();
+    if (key === "kind") renderEditor();
   };
   const result = el("div", { class: "result" });
   const modelsArea = el("textarea", { rows: "4", oninput: update("models", (v) => v.split("\n").map((s) => s.trim()).filter(Boolean)) });
@@ -183,7 +188,8 @@ function renderEditor() {
   };
   const kind = el("select", { onchange: update("kind") },
     el("option", { value: "openai_chat" }, "OpenAI-compatible (/chat/completions)"),
-    el("option", { value: "anthropic" }, "Anthropic-compatible (/v1/messages, Claude Code only)"));
+    el("option", { value: "anthropic" }, "Anthropic-compatible (/v1/messages, Claude Code only)"),
+    el("option", { value: "antigravity" }, "Google Antigravity (subscription, via ACP)"));
   kind.value = p.kind || "openai_chat";
 
   box.replaceChildren(
@@ -220,6 +226,150 @@ function renderEditor() {
 function renderProviders() {
   renderProviderList();
   renderEditor();
+}
+
+const KIND_LABELS = { openai_chat: "OpenAI", anthropic: "Anthropic", antigravity: "Antigravity" };
+
+function megabytes(bytes) {
+  return `${(bytes / 1048576).toFixed(0)} MB`;
+}
+
+/** Editor for the Antigravity provider: install, update, sign in, models. */
+function renderAntigravity(p, box) {
+  let latest = null;
+  let license = null;
+  const status = el("p", { class: "hint", id: "acp-status" }, "Checking the Antigravity ACP server…");
+  const actions = el("div", { class: "actions acp-actions" });
+  const auth = el("div", { class: "actions acp-auth" });
+  const result = el("div", { class: "result" });
+  const modelsArea = el("textarea", { rows: "4", oninput: (e) => {
+    p.models = e.target.value.split("\n").map((s) => s.trim()).filter(Boolean);
+    markDirty();
+  } });
+  modelsArea.value = (p.models || []).join("\n");
+
+  const run = async (button, busyText, work) => {
+    button.disabled = true;
+    result.className = "result";
+    result.textContent = busyText;
+    try {
+      await work();
+    } catch (err) {
+      result.className = "result bad";
+      result.textContent = String(err);
+    } finally {
+      button.disabled = false;
+    }
+  };
+
+  const fetchModels = async () => {
+    const ids = await invoke("fetch_models", { provider: p });
+    p.models = ids;
+    modelsArea.value = ids.join("\n");
+    if (!draft.models.default && ids.length) draft.models.default = `${p.id}/${ids[0]}`;
+    markDirty();
+    renderModels();
+    result.className = "result ok";
+    result.textContent = `Signed in. ${ids.length} models available; save to keep them.`;
+  };
+
+  const draw = (view) => {
+    if (view.latest_version) latest = view.latest_version;
+    if (view.license_url) license = view.license_url;
+    const installed = view.installed_version;
+    const parts = [];
+    if (installed) {
+      parts.push(`Installed: v${installed}${view.running ? " (running)" : ""}.`);
+      if (latest && latest !== installed) parts.push(`Update available: v${latest}.`);
+    } else {
+      parts.push("Not installed. Ferry downloads Google's official ACP server from dl.google.com (several hundred MB).");
+    }
+    if (view.latest_error) parts.push(`Could not check for updates: ${view.latest_error}`);
+    if (view.error) parts.push(`Last start failed: ${view.error}`);
+    status.textContent = parts.join(" ");
+
+    const installLabel = !installed
+      ? `Install${latest ? ` v${latest}` : ""}`
+      : latest && latest !== installed ? `Update to v${latest}` : "Reinstall";
+    const installButton = el("button", { class: installed && latest === installed ? "ghost small" : "primary small" }, installLabel);
+    installButton.addEventListener("click", () =>
+      run(installButton, "Downloading…", async () => {
+        draw(await invoke("acp_install"));
+        result.className = "result ok";
+        result.textContent = "Installed. Sign in below.";
+      }));
+    const buttons = [installButton];
+    if (installed && !view.running) {
+      const start = el("button", { class: "ghost small" }, "Start");
+      start.addEventListener("click", () => run(start, "Starting the server (this can take ~20 s)…", async () => {
+        draw(await invoke("acp_status", { start: true, checkLatest: false }));
+        result.textContent = "";
+      }));
+      buttons.push(start);
+    }
+    if (license) buttons.push(el("button", { class: "ghost small", onclick: () => openUrl(license) }, "Terms ↗"));
+    actions.replaceChildren(...buttons);
+
+    if (!view.running) {
+      auth.replaceChildren(el("span", { class: "hint" }, installed ? "Start the server to sign in." : "Install first."));
+    } else {
+      auth.replaceChildren(...view.auth_methods.map((method) => {
+        const button = el("button", { class: "ghost small", title: method.description || "" }, method.name || method.id);
+        button.addEventListener("click", () =>
+          run(button, "Waiting for sign-in to finish (a browser window may open)…", async () => {
+            draw(await invoke("acp_authenticate", { methodId: method.id }));
+            await fetchModels();
+          }));
+        return button;
+      }));
+    }
+  };
+
+  const fetchButton = el("button", { class: "ghost small" }, "Fetch models");
+  fetchButton.addEventListener("click", () => run(fetchButton, "Loading models…", fetchModels));
+  const testButton = el("button", { class: "ghost small" }, "Test connection");
+  testButton.addEventListener("click", () => {
+    const model = (p.models || [])[0] || "";
+    run(testButton, `Testing with ${model || "the default model"}…`, async () => {
+      result.textContent = await invoke("test_provider", { provider: p, model: model || "default" });
+      result.className = "result ok";
+    });
+  });
+
+  box.replaceChildren(
+    el("h2", {}, "Google Antigravity"),
+    el("p", { class: "hint" },
+      "Uses your Antigravity subscription through Google's official ACP server. Claude Code and Codex keep their own tools; " +
+      "Antigravity only acts as the model. This is not an officially supported use, so review Google's terms before relying on it."),
+    status,
+    actions,
+    el("h3", {}, "Sign in"),
+    auth,
+    field("Models (one per line; fetched after sign-in)", modelsArea),
+    el("div", { class: "actions" }, fetchButton, testButton),
+    result,
+    el("div", { class: "actions" },
+      el("button", { class: "danger", onclick: () => {
+        if (!confirm(`Delete provider "${p.id}"?`)) return;
+        draft.providers.splice(selected, 1);
+        selected = draft.providers.length ? 0 : null;
+        markDirty();
+        renderProviders();
+      } }, "Delete"),
+      el("button", { class: "primary", "data-save": true }, dirty ? "Save •" : "Save")),
+  );
+  invoke("acp_status", { start: false, checkLatest: true }).then(draw, (err) => (status.textContent = String(err)));
+}
+
+if (window.__TAURI__) {
+  window.__TAURI__.event.listen("acp-progress", ({ payload }) => {
+    const node = document.querySelector("#provider-editor .result");
+    if (!node) return;
+    node.className = "result";
+    node.textContent = payload.total
+      ? `Downloading… ${megabytes(payload.downloaded)} of ${megabytes(payload.total)}`
+      : `Downloading… ${megabytes(payload.downloaded)}`;
+  });
 }
 
 function addProvider() {

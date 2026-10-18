@@ -18,13 +18,14 @@ use futures_util::{Stream, StreamExt};
 use serde::Serialize;
 use serde_json::{json, Value};
 
+use crate::acp::{self, AcpManager};
 use crate::anthropic::{self, AnthropicEncoder};
 use crate::config::{Config, ProviderKind};
 use crate::recovery::{continuation_request, OverlapTrimmer, MAX_RECOVERIES};
 use crate::responses::{self, ResponsesEncoder};
 use crate::router::{self, Target};
 use crate::stream::{Event, Usage};
-use crate::upstream::{self, UpstreamError};
+use crate::upstream::{self, EventStream, UpstreamError};
 
 const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
 const LOG_CAPACITY: usize = 200;
@@ -47,6 +48,7 @@ struct Inner {
     config_mtime: Mutex<Option<SystemTime>>,
     http: reqwest::Client,
     log: Mutex<VecDeque<RequestRecord>>,
+    acp: Arc<AcpManager>,
 }
 
 /// Shared gateway state. Cheap to clone.
@@ -57,14 +59,25 @@ impl AppState {
     /// `config_path` enables reloading when another process (the desktop app
     /// or a text editor) rewrites the file.
     pub fn new(config: Config, config_path: Option<PathBuf>) -> Self {
+        Self::with_acp_root(config, config_path, AcpManager::default_root())
+    }
+
+    /// Like [`AppState::new`], keeping the Antigravity install under `acp_root`.
+    pub fn with_acp_root(config: Config, config_path: Option<PathBuf>, acp_root: PathBuf) -> Self {
         let mtime = config_path.as_ref().and_then(|p| modified(p));
+        let http = upstream::build_client();
         Self(Arc::new(Inner {
             config: RwLock::new(Arc::new(config)),
             config_path,
             config_mtime: Mutex::new(mtime),
-            http: upstream::build_client(),
+            acp: Arc::new(AcpManager::new(acp_root, http.clone())),
+            http,
             log: Mutex::new(VecDeque::with_capacity(LOG_CAPACITY)),
         }))
+    }
+
+    pub fn acp(&self) -> &Arc<AcpManager> {
+        &self.0.acp
     }
 
     pub fn config(&self) -> Arc<Config> {
@@ -345,6 +358,40 @@ impl Attempt<'_> {
     }
 }
 
+/// Open a stream on a target served from an OpenAI Chat-shaped request:
+/// an OpenAI-compatible API, or Antigravity through ACP.
+async fn open_events(
+    state: &AppState,
+    config: &Config,
+    headers: &HeaderMap,
+    target: &Target,
+    request: &Value,
+) -> Result<EventStream, UpstreamError> {
+    match target.provider.kind {
+        ProviderKind::OpenaiChat => {
+            let timeout = Duration::from_secs(config.server.connect_timeout_secs.max(5));
+            let response = upstream::send(
+                state.http(),
+                &target.provider,
+                request,
+                Some(headers),
+                timeout,
+                config.server.max_retries,
+            )
+            .await?;
+            Ok(Box::pin(upstream::chat_events(response)))
+        }
+        ProviderKind::Antigravity => acp::bridge::open(state.acp(), &target.model, request).await,
+        ProviderKind::Anthropic => Err(UpstreamError {
+            status: 400,
+            message: format!(
+                "{}: Anthropic-type providers only serve /v1/messages",
+                target.provider.id
+            ),
+        }),
+    }
+}
+
 /// Builds the OpenAI Chat request for a target, or `None` if the target
 /// cannot serve this kind of request.
 type BuildRequest = Arc<dyn Fn(&Target) -> Option<Value> + Send + Sync>;
@@ -364,11 +411,11 @@ struct Resume {
 fn resumable_events(
     resume: Resume,
     mut index: usize,
-    first: reqwest::Response,
+    first: EventStream,
     resumed_on: Arc<Mutex<Vec<String>>>,
 ) -> impl Stream<Item = Event> + Send + 'static {
     async_stream::stream! {
-        let mut response = first;
+        let mut events = first;
         let mut delivered = String::new();
         let mut usage = Usage::default();
         let mut recoveries = 0;
@@ -376,8 +423,6 @@ fn resumable_events(
         loop {
             let mut failure = None;
             {
-                let events = upstream::chat_events(response);
-                let mut events = std::pin::pin!(events);
                 while let Some(event) = events.next().await {
                     match event {
                         Event::Text(text) => {
@@ -435,7 +480,6 @@ fn resumable_events(
                 error = %message,
                 "stream broke; resuming"
             );
-            let timeout = Duration::from_secs(resume.config.server.connect_timeout_secs.max(5));
             let mut reopened = None;
             let mut last_error = None;
             for (i, target) in resume.targets.iter().enumerate().skip(index) {
@@ -443,16 +487,7 @@ fn resumable_events(
                 if !delivered.is_empty() {
                     request = continuation_request(request, &delivered);
                 }
-                match upstream::send(
-                    resume.state.http(),
-                    &target.provider,
-                    &request,
-                    Some(&resume.headers),
-                    timeout,
-                    resume.config.server.max_retries,
-                )
-                .await
-                {
+                match open_events(&resume.state, &resume.config, &resume.headers, target, &request).await {
                     Ok(next) => {
                         reopened = Some((i, next));
                         break;
@@ -466,7 +501,7 @@ fn resumable_events(
                 return;
             };
             index = i;
-            response = next;
+            events = next;
             resumed_on.lock().unwrap().push(resume.targets[i].reference());
             trimmer = (!delivered.is_empty()).then(|| OverlapTrimmer::new(&delivered));
         }
@@ -531,9 +566,9 @@ async fn messages(State(state): State<AppState>, headers: HeaderMap, body: Bytes
                     Err(err) => last_error = Some(err),
                 }
             }
-            ProviderKind::OpenaiChat => {
+            ProviderKind::OpenaiChat | ProviderKind::Antigravity => {
                 let chat = anthropic::to_chat_request(&body, &target.model, &target.provider);
-                match attempt.open(target, &chat).await {
+                match open_events(&state, &config, &headers, target, &chat).await {
                     Ok(response) => {
                         let estimate = anthropic::estimate_input_tokens(&body);
                         let mut encoder = AnthropicEncoder::new(&requested, estimate);
@@ -544,7 +579,7 @@ async fn messages(State(state): State<AppState>, headers: HeaderMap, body: Bytes
                             headers: headers.clone(),
                             targets: targets.clone(),
                             build: Arc::new(move |t: &Target| {
-                                (t.provider.kind == ProviderKind::OpenaiChat).then(|| {
+                                (t.provider.kind != ProviderKind::Anthropic).then(|| {
                                     anthropic::to_chat_request(&source, &t.model, &t.provider)
                                 })
                             }),
@@ -645,15 +680,10 @@ async fn responses_handler(
             return responses_error(400, &err.to_string());
         }
     };
-    let attempt = Attempt {
-        state: &state,
-        config: &config,
-        headers: &headers,
-    };
     let mut last_error = None;
     for (index, target) in targets.iter().enumerate() {
         recorder.record.routed_model = target.reference();
-        if target.provider.kind != ProviderKind::OpenaiChat {
+        if target.provider.kind == ProviderKind::Anthropic {
             last_error = Some(UpstreamError {
                 status: 400,
                 message: format!(
@@ -664,7 +694,7 @@ async fn responses_handler(
             continue;
         }
         let conversion = responses::to_chat_request(&body, &target.model, &target.provider);
-        match attempt.open(target, &conversion.request).await {
+        match open_events(&state, &config, &headers, target, &conversion.request).await {
             Ok(response) => {
                 let mut encoder = ResponsesEncoder::new(&requested, conversion.custom_tools);
                 let source = body.clone();
@@ -674,7 +704,7 @@ async fn responses_handler(
                     headers: headers.clone(),
                     targets: targets.clone(),
                     build: Arc::new(move |t: &Target| {
-                        (t.provider.kind == ProviderKind::OpenaiChat).then(|| {
+                        (t.provider.kind != ProviderKind::Anthropic).then(|| {
                             responses::to_chat_request(&source, &t.model, &t.provider).request
                         })
                     }),

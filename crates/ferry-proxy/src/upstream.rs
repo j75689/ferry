@@ -9,6 +9,9 @@ use serde_json::Value;
 use crate::config::{ProviderConfig, ProviderKind};
 use crate::stream::{error_message, ChatStreamDecoder, Event, SseParser};
 
+/// Neutral events from any provider, ending with `Finish` or `Error`.
+pub type EventStream = std::pin::Pin<Box<dyn Stream<Item = Event> + Send>>;
+
 /// Longest silence tolerated while a stream is open.
 const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(20);
@@ -40,7 +43,7 @@ fn is_retryable(status: u16) -> bool {
 fn endpoint(provider: &ProviderConfig) -> String {
     let base = provider.trimmed_base_url();
     match provider.kind {
-        ProviderKind::OpenaiChat => format!("{base}/chat/completions"),
+        ProviderKind::OpenaiChat | ProviderKind::Antigravity => format!("{base}/chat/completions"),
         ProviderKind::Anthropic if base.ends_with("/v1") => format!("{base}/messages"),
         ProviderKind::Anthropic => format!("{base}/v1/messages"),
     }
@@ -49,7 +52,7 @@ fn endpoint(provider: &ProviderConfig) -> String {
 pub fn models_endpoint(provider: &ProviderConfig) -> String {
     let base = provider.trimmed_base_url();
     match provider.kind {
-        ProviderKind::OpenaiChat => format!("{base}/models"),
+        ProviderKind::OpenaiChat | ProviderKind::Antigravity => format!("{base}/models"),
         ProviderKind::Anthropic if base.ends_with("/v1") => format!("{base}/models"),
         ProviderKind::Anthropic => format!("{base}/v1/models"),
     }
@@ -59,7 +62,7 @@ pub fn auth_headers(provider: &ProviderConfig, client_headers: Option<&HeaderMap
     let mut headers = HeaderMap::new();
     let key = provider.resolved_api_key();
     match provider.kind {
-        ProviderKind::OpenaiChat => {
+        ProviderKind::OpenaiChat | ProviderKind::Antigravity => {
             if !key.is_empty() {
                 if let Ok(value) = HeaderValue::from_str(&format!("Bearer {key}")) {
                     headers.insert(reqwest::header::AUTHORIZATION, value);

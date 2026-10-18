@@ -74,6 +74,8 @@ pub enum ProviderKind {
     OpenaiChat,
     /// Anthropic-compatible `POST {base_url}/v1/messages`.
     Anthropic,
+    /// Google Antigravity through its official ACP server; no URL or key.
+    Antigravity,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -81,6 +83,7 @@ pub struct ProviderConfig {
     pub id: String,
     #[serde(default)]
     pub kind: ProviderKind,
+    #[serde(default)]
     pub base_url: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub api_key: String,
@@ -235,8 +238,9 @@ impl Config {
             if !seen.insert(id) {
                 bail!("duplicate provider id {id:?}");
             }
-            if !(provider.base_url.starts_with("http://")
-                || provider.base_url.starts_with("https://"))
+            if provider.kind != ProviderKind::Antigravity
+                && !(provider.base_url.starts_with("http://")
+                    || provider.base_url.starts_with("https://"))
             {
                 bail!("provider {id:?} base_url must start with http:// or https://");
             }

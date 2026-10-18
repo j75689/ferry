@@ -83,6 +83,7 @@ main { padding: 14px 22px 40px; }
   padding: 16px 18px; margin-bottom: 14px;
 }
 h2 { font-size: 15px; margin: 0 0 8px; }
+h3 { font-size: 13px; margin: 14px 0 6px; }
 .hint { color: var(--muted); font-size: 12.5px; margin: 4px 0 12px; }
 .empty { color: var(--muted); }
 .req { color: var(--bad); }
@@ -145,3 +146,5 @@ td.outcome-bad { color: var(--bad); white-space: normal; min-width: 220px; }
   max-width: min(640px, calc(100vw - 32px));
 }
 .hidden { display: none !important; }
+
+.actions.acp-actions, .actions.acp-auth { justify-content: flex-start; }

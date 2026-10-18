@@ -15,7 +15,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Manager, State, WindowEvent};
+use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
 
 struct Gateway {
     state: AppState,
@@ -151,9 +151,71 @@ async fn fetch_models(
     gateway: State<'_, Gateway>,
     provider: ProviderConfig,
 ) -> Result<Vec<String>, String> {
+    if provider.kind == ProviderKind::Antigravity {
+        let models = gateway.state.acp().models().await?;
+        return Ok(models.into_iter().map(|m| m.id).collect());
+    }
     ferry_proxy::upstream::list_models(gateway.state.http(), &provider)
         .await
         .map_err(|e| e.to_string())
+}
+
+#[derive(Serialize)]
+struct AcpView {
+    #[serde(flatten)]
+    status: ferry_proxy::acp::Status,
+    latest_version: Option<String>,
+    latest_error: Option<String>,
+    license_url: Option<String>,
+}
+
+/// Antigravity ACP server state. `check_latest` also asks the registry.
+#[tauri::command]
+async fn acp_status(
+    gateway: State<'_, Gateway>,
+    start: bool,
+    check_latest: bool,
+) -> Result<AcpView, String> {
+    let acp = gateway.state.acp();
+    let status = acp.status(start).await;
+    let (latest_version, latest_error, license_url) = if check_latest {
+        match acp.latest().await {
+            Ok(release) => (Some(release.version), None, release.license_url),
+            Err(err) => (None, Some(err), None),
+        }
+    } else {
+        (None, None, None)
+    };
+    Ok(AcpView {
+        status,
+        latest_version,
+        latest_error,
+        license_url,
+    })
+}
+
+/// Download (or update to) the latest official ACP server, reporting
+/// progress as `acp-progress` events.
+#[tauri::command]
+async fn acp_install(app: AppHandle, gateway: State<'_, Gateway>) -> Result<AcpView, String> {
+    let progress_app = app.clone();
+    gateway
+        .state
+        .acp()
+        .install_latest(move |progress| {
+            let _ = progress_app.emit("acp-progress", progress);
+        })
+        .await?;
+    acp_status(gateway, true, false).await
+}
+
+#[tauri::command]
+async fn acp_authenticate(
+    gateway: State<'_, Gateway>,
+    method_id: String,
+) -> Result<AcpView, String> {
+    gateway.state.acp().authenticate(&method_id).await?;
+    acp_status(gateway, true, false).await
 }
 
 /// Send a tiny real request so users can confirm key, URL and model at once.
@@ -166,7 +228,11 @@ async fn test_provider(
     if model.trim().is_empty() {
         return Err("Enter a model name to test first".into());
     }
+    if provider.kind == ProviderKind::Antigravity {
+        return test_antigravity(&gateway, &model).await;
+    }
     let body = match provider.kind {
+        ProviderKind::Antigravity => unreachable!("handled above"),
         ProviderKind::OpenaiChat => json!({
             "model": model,
             "max_tokens": 32,
@@ -312,6 +378,31 @@ fn add_to_path(dir: &std::path::Path) -> Result<String, String> {
     }
 }
 
+async fn test_antigravity(gateway: &Gateway, model: &str) -> Result<String, String> {
+    use ferry_proxy::stream::Event;
+    use futures_util::StreamExt;
+    let started = std::time::Instant::now();
+    let request =
+        json!({"messages": [{"role": "user", "content": "Reply with the single word: OK"}]});
+    let mut events = ferry_proxy::acp::bridge::open(gateway.state.acp(), model, &request)
+        .await
+        .map_err(|e| e.message)?;
+    let mut text = String::new();
+    while let Some(event) = events.next().await {
+        match event {
+            Event::Text(more) => text.push_str(&more),
+            Event::Error(message) => return Err(message),
+            Event::Finish(_) => break,
+            _ => {}
+        }
+    }
+    let text: String = text.trim().chars().take(120).collect();
+    Ok(format!(
+        "OK in {} ms: {text}",
+        started.elapsed().as_millis()
+    ))
+}
+
 fn show_main(app: &AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
@@ -362,6 +453,9 @@ fn main() {
             fetch_models,
             test_provider,
             install_cli,
+            acp_status,
+            acp_install,
+            acp_authenticate,
         ])
         .setup(move |app| {
             let handle = app.handle().clone();
@@ -430,6 +524,13 @@ fn main() {
                 let _ = window.hide();
             }
         })
-        .run(tauri::generate_context!())
-        .expect("failed to run Ferry desktop app");
+        .build(tauri::generate_context!())
+        .expect("failed to build Ferry desktop app")
+        .run(|app, event| {
+            // Do not leave the Antigravity ACP server running after we quit.
+            if let tauri::RunEvent::Exit = event {
+                let acp = app.state::<Gateway>().state.acp().clone();
+                tauri::async_runtime::block_on(acp.stop());
+            }
+        });
 }

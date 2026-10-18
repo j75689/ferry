@@ -2,6 +2,7 @@
 //! (OpenAI Responses API) run on any OpenAI-compatible or Anthropic-compatible
 //! provider.
 
+pub mod acp;
 pub mod anthropic;
 pub mod config;
 pub mod presets;
