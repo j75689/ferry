@@ -293,6 +293,179 @@ fn assistant_message(content: Option<&Value>, provider: &ProviderConfig) -> Valu
     Value::Object(message)
 }
 
+/// Anthropic requires `max_tokens`; used when the client did not set one.
+const DEFAULT_MAX_TOKENS: u64 = 8192;
+
+/// Build an Anthropic Messages request from an OpenAI Chat request (the
+/// shape every ingress converts to), so Anthropic-type providers can serve
+/// Codex and resumed streams.
+pub fn from_chat_request(chat: &Value, model: &str, provider: &ProviderConfig) -> Value {
+    let mut system = Vec::new();
+    let mut messages: Vec<Value> = Vec::new();
+    let push = |messages: &mut Vec<Value>, role: &str, blocks: Vec<Value>| {
+        if blocks.is_empty() {
+            return;
+        }
+        // Anthropic needs alternating roles; merge neighbours instead.
+        match messages.last_mut() {
+            Some(last) if last["role"] == role => {
+                if let Some(content) = last["content"].as_array_mut() {
+                    content.extend(blocks);
+                }
+            }
+            _ => messages.push(json!({"role": role, "content": blocks})),
+        }
+    };
+    for message in chat["messages"].as_array().into_iter().flatten() {
+        match message["role"].as_str().unwrap_or("user") {
+            "system" | "developer" => system.push(chat_text(&message["content"])),
+            "assistant" => {
+                let mut blocks = Vec::new();
+                let text = chat_text(&message["content"]);
+                if !text.is_empty() {
+                    blocks.push(json!({"type": "text", "text": text}));
+                }
+                for call in message["tool_calls"].as_array().into_iter().flatten() {
+                    let arguments = call
+                        .pointer("/function/arguments")
+                        .and_then(Value::as_str)
+                        .unwrap_or("{}");
+                    let input = match serde_json::from_str::<Value>(arguments) {
+                        Ok(Value::Object(map)) => Value::Object(map),
+                        _ => json!({"input": arguments}),
+                    };
+                    blocks.push(json!({
+                        "type": "tool_use",
+                        "id": call["id"].as_str().unwrap_or(""),
+                        "name": call.pointer("/function/name").and_then(Value::as_str).unwrap_or(""),
+                        "input": input,
+                    }));
+                }
+                push(&mut messages, "assistant", blocks);
+            }
+            "tool" => push(
+                &mut messages,
+                "user",
+                vec![json!({
+                    "type": "tool_result",
+                    "tool_use_id": message["tool_call_id"].as_str().unwrap_or(""),
+                    "content": chat_text(&message["content"]),
+                })],
+            ),
+            _ => push(&mut messages, "user", chat_user_blocks(&message["content"])),
+        }
+    }
+    if messages.first().is_some_and(|m| m["role"] != "user") {
+        messages.insert(
+            0,
+            json!({"role": "user", "content": [{"type": "text", "text": "Continue."}]}),
+        );
+    }
+
+    let max = chat["max_tokens"].as_u64().unwrap_or(DEFAULT_MAX_TOKENS);
+    let max = provider
+        .max_tokens_cap
+        .map_or(max, |cap| max.min(cap as u64));
+    let mut request = Map::new();
+    request.insert("model".into(), json!(model));
+    request.insert("max_tokens".into(), json!(max));
+    request.insert("stream".into(), json!(true));
+    request.insert("messages".into(), Value::Array(messages));
+    let system: Vec<String> = system.into_iter().filter(|s| !s.is_empty()).collect();
+    if !system.is_empty() {
+        request.insert("system".into(), json!(system.join("\n\n")));
+    }
+    for key in ["temperature", "top_p"] {
+        if let Some(value) = chat.get(key).filter(|v| v.is_number()) {
+            request.insert(key.into(), value.clone());
+        }
+    }
+    match chat.get("stop") {
+        Some(Value::String(stop)) => {
+            request.insert("stop_sequences".into(), json!([stop]));
+        }
+        Some(Value::Array(stops)) if !stops.is_empty() => {
+            request.insert("stop_sequences".into(), Value::Array(stops.clone()));
+        }
+        _ => {}
+    }
+    let tools: Vec<Value> = chat["tools"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|tool| {
+            let function = tool.get("function")?;
+            Some(json!({
+                "name": function.get("name")?,
+                "description": function.get("description").cloned().unwrap_or(json!("")),
+                "input_schema": clean_schema(function.get("parameters")),
+            }))
+        })
+        .collect();
+    if !tools.is_empty() {
+        request.insert("tools".into(), Value::Array(tools));
+        let parallel = chat["parallel_tool_calls"].as_bool() != Some(false);
+        let mut choice = match &chat["tool_choice"] {
+            Value::String(c) if c == "required" => json!({"type": "any"}),
+            Value::String(c) if c == "none" => json!({"type": "none"}),
+            Value::Object(o) => match o.get("function").and_then(|f| f.get("name")) {
+                Some(name) => json!({"type": "tool", "name": name}),
+                None => json!({"type": "auto"}),
+            },
+            _ => json!({"type": "auto"}),
+        };
+        if !parallel && choice["type"] != "none" {
+            choice["disable_parallel_tool_use"] = json!(true);
+        }
+        request.insert("tool_choice".into(), choice);
+    }
+    Value::Object(request)
+}
+
+fn chat_text(content: &Value) -> String {
+    match content {
+        Value::String(text) => text.clone(),
+        Value::Array(parts) => parts
+            .iter()
+            .filter_map(|p| p["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
+fn chat_user_blocks(content: &Value) -> Vec<Value> {
+    let Value::Array(parts) = content else {
+        let text = chat_text(content);
+        return if text.is_empty() {
+            Vec::new()
+        } else {
+            vec![json!({"type": "text", "text": text})]
+        };
+    };
+    parts
+        .iter()
+        .filter_map(|part| match part["type"].as_str() {
+            Some("image_url") => {
+                let url = part.pointer("/image_url/url").and_then(Value::as_str)?;
+                Some(
+                    match url
+                        .strip_prefix("data:")
+                        .and_then(|r| r.split_once(";base64,"))
+                    {
+                        Some((media_type, data)) => json!({"type": "image",
+                        "source": {"type": "base64", "media_type": media_type, "data": data}}),
+                        None => json!({"type": "image", "source": {"type": "url", "url": url}}),
+                    },
+                )
+            }
+            _ => part["text"]
+                .as_str()
+                .map(|t| json!({"type": "text", "text": t})),
+        })
+        .collect()
+}
+
 /// Rough token estimate for `count_tokens` and `message_start` usage.
 pub fn estimate_input_tokens(body: &Value) -> u64 {
     let mut chars = 0usize;
@@ -602,6 +775,60 @@ mod tests {
             messages[4],
             json!({"role": "user", "content": "now summarize"})
         );
+    }
+
+    #[test]
+    fn chat_requests_become_anthropic_requests() {
+        let chat = json!({
+            "messages": [
+                {"role": "system", "content": "You are Codex."},
+                {"role": "system", "content": "Repo rules."},
+                {"role": "user", "content": [{"type": "text", "text": "list files"},
+                                              {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}]},
+                {"role": "assistant", "content": "", "tool_calls": [
+                    {"id": "c1", "function": {"name": "shell", "arguments": "{\"command\":[\"ls\"]}"}},
+                    {"id": "c2", "function": {"name": "apply_patch", "arguments": "not json"}}]},
+                {"role": "tool", "tool_call_id": "c1", "content": "a.txt"},
+                {"role": "tool", "tool_call_id": "c2", "content": "ok"},
+                {"role": "user", "content": "thanks"}
+            ],
+            "tools": [{"type": "function", "function": {"name": "shell", "description": "run", "parameters": {"$schema": "x", "type": "object"}}}],
+            "tool_choice": "required",
+            "parallel_tool_calls": false,
+            "max_tokens": 50000
+        });
+        let mut provider = provider();
+        provider.max_tokens_cap = Some(4096);
+        let request = from_chat_request(&chat, "claude-x", &provider);
+        assert_eq!(request["system"], "You are Codex.\n\nRepo rules.");
+        assert_eq!(request["max_tokens"], 4096);
+        assert_eq!(
+            request["tool_choice"],
+            json!({"type": "any", "disable_parallel_tool_use": true})
+        );
+        assert!(request["tools"][0]["input_schema"].get("$schema").is_none());
+        let messages = request["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 3, "{messages:?}");
+        assert_eq!(
+            messages[0]["content"][1]["source"]["media_type"],
+            "image/png"
+        );
+        assert_eq!(
+            messages[1]["content"][0]["input"],
+            json!({"command": ["ls"]})
+        );
+        assert_eq!(
+            messages[1]["content"][1]["input"],
+            json!({"input": "not json"})
+        );
+        // Both tool results and the next user text share one user turn.
+        let results: Vec<&str> = messages[2]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| b["type"].as_str().unwrap())
+            .collect();
+        assert_eq!(results, ["tool_result", "tool_result", "text"]);
     }
 
     #[test]

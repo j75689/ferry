@@ -382,13 +382,20 @@ async fn open_events(
             Ok(Box::pin(upstream::chat_events(response)))
         }
         ProviderKind::Antigravity => acp::bridge::open(state.acp(), &target.model, request).await,
-        ProviderKind::Anthropic => Err(UpstreamError {
-            status: 400,
-            message: format!(
-                "{}: Anthropic-type providers only serve /v1/messages",
-                target.provider.id
-            ),
-        }),
+        ProviderKind::Anthropic => {
+            let timeout = Duration::from_secs(config.server.connect_timeout_secs.max(5));
+            let native = anthropic::from_chat_request(request, &target.model, &target.provider);
+            let response = upstream::send(
+                state.http(),
+                &target.provider,
+                &native,
+                Some(headers),
+                timeout,
+                config.server.max_retries,
+            )
+            .await?;
+            Ok(Box::pin(upstream::messages_events(response)))
+        }
     }
 }
 
@@ -579,9 +586,7 @@ async fn messages(State(state): State<AppState>, headers: HeaderMap, body: Bytes
                             headers: headers.clone(),
                             targets: targets.clone(),
                             build: Arc::new(move |t: &Target| {
-                                (t.provider.kind != ProviderKind::Anthropic).then(|| {
-                                    anthropic::to_chat_request(&source, &t.model, &t.provider)
-                                })
+                                Some(anthropic::to_chat_request(&source, &t.model, &t.provider))
                             }),
                         };
                         let events =
@@ -683,16 +688,6 @@ async fn responses_handler(
     let mut last_error = None;
     for (index, target) in targets.iter().enumerate() {
         recorder.record.routed_model = target.reference();
-        if target.provider.kind == ProviderKind::Anthropic {
-            last_error = Some(UpstreamError {
-                status: 400,
-                message: format!(
-                    "{}: Anthropic-type providers cannot serve Codex yet",
-                    target.provider.id
-                ),
-            });
-            continue;
-        }
         let conversion = responses::to_chat_request(&body, &target.model, &target.provider);
         match open_events(&state, &config, &headers, target, &conversion.request).await {
             Ok(response) => {
@@ -704,9 +699,7 @@ async fn responses_handler(
                     headers: headers.clone(),
                     targets: targets.clone(),
                     build: Arc::new(move |t: &Target| {
-                        (t.provider.kind != ProviderKind::Anthropic).then(|| {
-                            responses::to_chat_request(&source, &t.model, &t.provider).request
-                        })
+                        Some(responses::to_chat_request(&source, &t.model, &t.provider).request)
                     }),
                 };
                 let events = resumable_events(resume, index, response, recorder.resumed_on.clone());

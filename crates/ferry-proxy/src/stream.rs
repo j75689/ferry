@@ -197,6 +197,143 @@ struct PendingTool {
     arguments: String,
 }
 
+/// Turns one provider's SSE frames into [`Event`]s.
+pub trait FrameDecoder {
+    fn push_frame(&mut self, frame: &SseFrame) -> Vec<Event>;
+    /// The body ended; report an error unless the response had finished.
+    fn end_of_body(&mut self) -> Vec<Event>;
+}
+
+impl FrameDecoder for ChatStreamDecoder {
+    fn push_frame(&mut self, frame: &SseFrame) -> Vec<Event> {
+        ChatStreamDecoder::push_frame(self, frame)
+    }
+    fn end_of_body(&mut self) -> Vec<Event> {
+        ChatStreamDecoder::end_of_body(self)
+    }
+}
+
+#[derive(Default)]
+struct OpenTool {
+    id: String,
+    name: String,
+    arguments: String,
+}
+
+/// Reduces Anthropic Messages SSE (`message_start` ... `message_stop`) to [`Event`]s.
+#[derive(Default)]
+pub struct MessagesStreamDecoder {
+    tool: Option<OpenTool>,
+    usage: Usage,
+    finish: Option<Finish>,
+    done: bool,
+}
+
+impl FrameDecoder for MessagesStreamDecoder {
+    fn push_frame(&mut self, frame: &SseFrame) -> Vec<Event> {
+        let mut out = Vec::new();
+        if self.done {
+            return out;
+        }
+        let Ok(data) = serde_json::from_str::<Value>(&frame.data) else {
+            return out;
+        };
+        let num = |v: &Value| v.as_u64().unwrap_or(0);
+        match data["type"].as_str().unwrap_or("") {
+            "message_start" => {
+                let usage = &data["message"]["usage"];
+                self.usage.input_tokens = num(&usage["input_tokens"]);
+                self.usage.cached_tokens = num(&usage["cache_read_input_tokens"]);
+            }
+            "content_block_start" => {
+                let block = &data["content_block"];
+                if block["type"] == "tool_use" {
+                    self.tool = Some(OpenTool {
+                        id: block["id"].as_str().unwrap_or("").to_string(),
+                        name: block["name"].as_str().unwrap_or("").to_string(),
+                        arguments: String::new(),
+                    });
+                }
+            }
+            "content_block_delta" => {
+                let delta = &data["delta"];
+                match delta["type"].as_str() {
+                    Some("text_delta") => {
+                        if let Some(text) = delta["text"].as_str().filter(|t| !t.is_empty()) {
+                            out.push(Event::Text(text.to_string()));
+                        }
+                    }
+                    Some("thinking_delta") => {
+                        if let Some(text) = delta["thinking"].as_str().filter(|t| !t.is_empty()) {
+                            out.push(Event::Reasoning(text.to_string()));
+                        }
+                    }
+                    Some("input_json_delta") => {
+                        if let (Some(tool), Some(part)) =
+                            (&mut self.tool, delta["partial_json"].as_str())
+                        {
+                            tool.arguments.push_str(part);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            "content_block_stop" => {
+                if let Some(tool) = self.tool.take() {
+                    out.push(Event::ToolCall {
+                        id: if tool.id.is_empty() {
+                            new_id("toolu_")
+                        } else {
+                            tool.id
+                        },
+                        name: tool.name,
+                        arguments: if tool.arguments.trim().is_empty() {
+                            "{}".into()
+                        } else {
+                            tool.arguments
+                        },
+                    });
+                }
+            }
+            "message_delta" => {
+                if let Some(output) = data["usage"]["output_tokens"].as_u64() {
+                    self.usage.output_tokens = output;
+                }
+                if let Some(reason) = data["delta"]["stop_reason"].as_str() {
+                    self.finish = Some(match reason {
+                        "max_tokens" => Finish::Length,
+                        "tool_use" => Finish::ToolCalls,
+                        "refusal" => Finish::ContentFilter,
+                        _ => Finish::Stop,
+                    });
+                }
+            }
+            "message_stop" => {
+                self.done = true;
+                out.push(Event::Usage(self.usage));
+                out.push(Event::Finish(self.finish.unwrap_or(Finish::Stop)));
+            }
+            "error" => {
+                self.done = true;
+                out.push(Event::Error(error_message(&data["error"])));
+            }
+            _ => {}
+        }
+        out
+    }
+
+    fn end_of_body(&mut self) -> Vec<Event> {
+        if self.done {
+            return Vec::new();
+        }
+        self.done = true;
+        vec![
+            Event::Usage(self.usage),
+            Event::Error("provider stream ended before the response finished".into()),
+        ]
+    }
+}
+
 /// Reduces OpenAI `chat.completion.chunk` objects to [`Event`]s.
 #[derive(Default)]
 pub struct ChatStreamDecoder {
@@ -455,6 +592,58 @@ mod tests {
                 Event::Finish(Finish::Length),
             ]
         );
+    }
+
+    #[test]
+    fn decodes_anthropic_messages_stream() {
+        let frames = [
+            json!({"type":"message_start","message":{"usage":{"input_tokens":12,"cache_read_input_tokens":4}}}),
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"plan"}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"s"}}),
+            json!({"type":"content_block_stop","index":0}),
+            json!({"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}),
+            json!({"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"Running."}}),
+            json!({"type":"content_block_stop","index":1}),
+            json!({"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"toolu_1","name":"shell","input":{}}}),
+            json!({"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\"command\":"}}),
+            json!({"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"[\"ls\"]}"}}),
+            json!({"type":"content_block_stop","index":2}),
+            json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":9}}),
+            json!({"type":"message_stop"}),
+        ];
+        let mut decoder = MessagesStreamDecoder::default();
+        let events: Vec<Event> = frames
+            .iter()
+            .flat_map(|f| {
+                decoder.push_frame(&SseFrame {
+                    event: None,
+                    data: f.to_string(),
+                })
+            })
+            .collect();
+        assert_eq!(
+            events,
+            vec![
+                Event::Reasoning("plan".into()),
+                Event::Text("Running.".into()),
+                Event::ToolCall {
+                    id: "toolu_1".into(),
+                    name: "shell".into(),
+                    arguments: "{\"command\":[\"ls\"]}".into()
+                },
+                Event::Usage(Usage {
+                    input_tokens: 12,
+                    output_tokens: 9,
+                    cached_tokens: 4,
+                    reasoning_tokens: 0
+                }),
+                Event::Finish(Finish::ToolCalls),
+            ]
+        );
+        assert!(decoder.end_of_body().is_empty());
+        let mut cut = MessagesStreamDecoder::default();
+        assert!(matches!(cut.end_of_body().last(), Some(Event::Error(_))));
     }
 
     #[test]

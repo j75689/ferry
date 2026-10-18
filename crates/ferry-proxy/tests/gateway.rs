@@ -442,3 +442,106 @@ async fn reasoning_after_text_survives_when_nothing_broke() {
     assert_eq!(thinking, "now step 2");
     assert_eq!(text_of(&frames), "Step 1. Step 2.");
 }
+
+/// An Anthropic-compatible upstream that answers every turn with a shell call.
+async fn anthropic_upstream(seen: Arc<std::sync::Mutex<Value>>) -> String {
+    let app = Router::new().route(
+        "/v1/messages",
+        post(move |headers: axum::http::HeaderMap, Json(body): Json<Value>| {
+            let seen = seen.clone();
+            async move {
+                assert_eq!(headers["x-api-key"], "anthropic-key");
+                *seen.lock().unwrap() = body;
+                let events = [
+                    json!({"type":"message_start","message":{"usage":{"input_tokens":30}}}),
+                    json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+                    json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Listing."}}),
+                    json!({"type":"content_block_stop","index":0}),
+                    json!({"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_9","name":"shell","input":{}}}),
+                    json!({"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"command\":[\"ls\"]}"}}),
+                    json!({"type":"content_block_stop","index":1}),
+                    json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":7}}),
+                    json!({"type":"message_stop"}),
+                ];
+                let body: String = events
+                    .iter()
+                    .map(|e| format!("event: {}\ndata: {e}\n\n", e["type"].as_str().unwrap()))
+                    .collect();
+                ([("content-type", "text/event-stream")], body).into_response()
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/v1", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    url
+}
+
+#[tokio::test]
+async fn codex_runs_on_an_anthropic_provider() {
+    let seen = Arc::new(std::sync::Mutex::new(Value::Null));
+    let upstream = anthropic_upstream(seen.clone()).await;
+    let config = Config::from_toml(&format!(
+        r#"
+        [server]
+        auth_token = "{TOKEN}"
+
+        [models]
+        default = "claude/claude-sonnet-4-5"
+
+        [[providers]]
+        id = "claude"
+        kind = "anthropic"
+        base_url = "{upstream}"
+        api_key = "anthropic-key"
+        "#
+    ))
+    .unwrap();
+    let server = ferry_proxy::spawn(AppState::new(config, None), "127.0.0.1", 0)
+        .await
+        .unwrap();
+    let frames = post_sse(
+        &format!("{}/v1/responses", server.url()),
+        json!({
+            "model": "claude/claude-sonnet-4-5",
+            "instructions": "You are Codex.",
+            "stream": true,
+            "tools": [{"type": "function", "name": "shell", "parameters": {"type": "object"}}],
+            "input": [
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "ls"}]},
+                {"type": "function_call", "call_id": "c0", "name": "shell", "arguments": "{\"command\":[\"pwd\"]}"},
+                {"type": "function_call_output", "call_id": "c0", "output": "/repo"}
+            ]
+        }),
+    )
+    .await;
+    // The upstream got a well-formed Anthropic request.
+    let sent = seen.lock().unwrap().clone();
+    assert_eq!(sent["model"], "claude-sonnet-4-5");
+    assert_eq!(sent["system"], "You are Codex.");
+    assert_eq!(sent["stream"], true);
+    assert_eq!(sent["tools"][0]["name"], "shell");
+    let roles: Vec<&str> = sent["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["role"].as_str().unwrap())
+        .collect();
+    assert_eq!(roles, ["user", "assistant", "user"]);
+    assert_eq!(sent["messages"][2]["content"][0]["type"], "tool_result");
+    // Codex got Responses items back.
+    let done: Vec<&Value> = frames
+        .iter()
+        .filter(|(n, _)| n == "response.output_item.done")
+        .map(|(_, d)| &d["item"])
+        .collect();
+    assert_eq!(done[0]["type"], "message");
+    assert_eq!(done[0]["content"][0]["text"], "Listing.");
+    assert_eq!(done[1]["type"], "function_call");
+    assert_eq!(done[1]["call_id"], "toolu_9");
+    assert_eq!(done[1]["arguments"], "{\"command\":[\"ls\"]}");
+    let completed = &frames.last().unwrap().1["response"];
+    assert_eq!(completed["usage"]["input_tokens"], 30);
+    assert_eq!(completed["usage"]["output_tokens"], 7);
+    server.stop().await;
+}

@@ -7,7 +7,9 @@ use reqwest::header::{HeaderMap, HeaderName, HeaderValue, CONTENT_TYPE};
 use serde_json::Value;
 
 use crate::config::{ProviderConfig, ProviderKind};
-use crate::stream::{error_message, ChatStreamDecoder, Event, SseParser};
+use crate::stream::{
+    error_message, ChatStreamDecoder, Event, FrameDecoder, MessagesStreamDecoder, SseParser,
+};
 
 /// Neutral events from any provider, ending with `Finish` or `Error`.
 pub type EventStream = std::pin::Pin<Box<dyn Stream<Item = Event> + Send>>;
@@ -197,10 +199,21 @@ pub fn upstream_error_text(body: &str) -> String {
 
 /// Decode an OpenAI Chat SSE response into neutral events, ending with `Finish` or `Error`.
 pub fn chat_events(response: reqwest::Response) -> impl Stream<Item = Event> + Send {
+    decode_events(response, ChatStreamDecoder::default())
+}
+
+/// Decode an Anthropic Messages SSE response into neutral events.
+pub fn messages_events(response: reqwest::Response) -> impl Stream<Item = Event> + Send {
+    decode_events(response, MessagesStreamDecoder::default())
+}
+
+fn decode_events<D: FrameDecoder + Send + 'static>(
+    response: reqwest::Response,
+    mut decoder: D,
+) -> impl Stream<Item = Event> + Send {
     async_stream::stream! {
         let mut body = response.bytes_stream();
         let mut parser = SseParser::default();
-        let mut decoder = ChatStreamDecoder::default();
         loop {
             let next = match tokio::time::timeout(STREAM_IDLE_TIMEOUT, body.next()).await {
                 Ok(next) => next,

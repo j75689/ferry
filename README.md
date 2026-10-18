@@ -31,6 +31,9 @@ codex ──model_providers.ferry──▶ │  /v1/responses (Codex)   │     
 * Requests for `opus` / `sonnet` / `haiku` map to configured models. On an
   error before streaming starts, retryable errors are retried and then the
   configured fallbacks are tried in order.
+* Every provider kind serves both clients: Claude Code and Codex requests are
+  converted to OpenAI Chat, Anthropic Messages, or ACP as the target needs.
+  Claude Code requests to Anthropic-type providers are passed through as-is.
 * If a stream breaks after the client has already received part of the
   answer (connection reset, idle timeout, or a body that ends without a
   finish), Ferry reopens the request with the partial answer replayed and
@@ -150,7 +153,6 @@ cd app/src-tauri && cargo tauri build --config tauri.release.conf.json
 
 ## Not yet
 
-* Codex against `anthropic`-kind providers (Claude Code works with both kinds).
 * Local short-circuits for Claude Code's background requests (titles,
   quota probes); they currently go to the configured haiku model.
 * Server-side tools (`web_search`, `web_fetch`) are dropped rather than

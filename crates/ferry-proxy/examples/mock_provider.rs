@@ -6,7 +6,8 @@
 //! the last user message; if that message contains `RUN_TOOL` it first calls
 //! the client's shell tool (`Bash` for Claude Code, `shell` for Codex).
 //! Requests for the model `flaky` drop the connection halfway through the
-//! first answer, to exercise stream resumption.
+//! first answer, to exercise stream resumption. `POST /v1/messages` behaves
+//! the same way in Anthropic format, for `kind = "anthropic"` providers.
 
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
@@ -132,6 +133,85 @@ async fn chat(Json(body): Json<Value>) -> axum::response::Response {
     ([("content-type", "text/event-stream")], sse).into_response()
 }
 
+/// The same behaviour as `chat`, speaking the Anthropic Messages API.
+async fn messages(Json(body): Json<Value>) -> axum::response::Response {
+    let blocks = |m: &Value| -> Vec<Value> {
+        match &m["content"] {
+            Value::String(text) => vec![json!({"type": "text", "text": text})],
+            Value::Array(items) => items.clone(),
+            _ => Vec::new(),
+        }
+    };
+    let messages = body["messages"].as_array().cloned().unwrap_or_default();
+    let user_text: Vec<String> = messages
+        .iter()
+        .filter(|m| m["role"] == "user")
+        .flat_map(&blocks)
+        .filter_map(|b| b["text"].as_str().map(str::to_string))
+        .collect();
+    let tool_output = messages
+        .iter()
+        .rev()
+        .flat_map(&blocks)
+        .find(|b| b["type"] == "tool_result")
+        .map(|b| match &b["content"] {
+            Value::String(text) => text.clone(),
+            other => text_of(other),
+        });
+    let tool = body["tools"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find_map(|t| {
+            let name = t["name"].as_str()?;
+            matches!(name, "Bash" | "shell" | "exec_command").then(|| name.to_string())
+        });
+    let mut events = vec![
+        json!({"type": "message_start", "message": {"id": "msg_mock", "type": "message", "role": "assistant", "content": [],
+               "model": body["model"], "usage": {"input_tokens": 100, "output_tokens": 0}}}),
+    ];
+    let stop = match (tool, tool_output) {
+        (Some(name), None) if user_text.iter().any(|t| t.contains("RUN_TOOL")) => {
+            let args = match name.as_str() {
+                "Bash" => {
+                    json!({"command": "echo ferry-tool-ok", "description": "Ferry mock tool call"})
+                }
+                "exec_command" => json!({"cmd": "echo ferry-tool-ok"}),
+                _ => json!({"command": ["echo", "ferry-tool-ok"]}),
+            };
+            events.push(json!({"type": "content_block_start", "index": 0,
+                               "content_block": {"type": "tool_use", "id": "toolu_mock1", "name": name, "input": {}}}));
+            events.push(json!({"type": "content_block_delta", "index": 0,
+                               "delta": {"type": "input_json_delta", "partial_json": args.to_string()}}));
+            events.push(json!({"type": "content_block_stop", "index": 0}));
+            "tool_use"
+        }
+        (_, output) => {
+            let text = match output {
+                Some(output) => format!("Tool said: {}", output.trim()),
+                None => format!(
+                    "Mock reply to: {}",
+                    user_text
+                        .last()
+                        .map(|t| t.lines().next().unwrap_or(""))
+                        .unwrap_or("")
+                ),
+            };
+            events.push(json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}));
+            events.push(json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": text}}));
+            events.push(json!({"type": "content_block_stop", "index": 0}));
+            "end_turn"
+        }
+    };
+    events.push(json!({"type": "message_delta", "delta": {"stop_reason": stop}, "usage": {"output_tokens": 10}}));
+    events.push(json!({"type": "message_stop"}));
+    let sse: String = events
+        .iter()
+        .map(|e| format!("event: {}\ndata: {e}\n\n", e["type"].as_str().unwrap_or("")))
+        .collect();
+    ([("content-type", "text/event-stream")], sse).into_response()
+}
+
 async fn models() -> Json<Value> {
     Json(json!({"object": "list", "data": [{"id": "mock-1", "object": "model"}]}))
 }
@@ -144,6 +224,7 @@ async fn main() {
         .unwrap_or(9999);
     let app = Router::new()
         .route("/v1/chat/completions", post(chat))
+        .route("/v1/messages", post(messages))
         .route("/v1/models", get(models));
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
         .await
