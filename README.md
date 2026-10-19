@@ -80,6 +80,9 @@ codex ──model_providers.ferry──▶ │  /v1/responses (Codex)   │     
 ## Use
 
 1. Install the desktop app (CI builds `.dmg`, `.msi`/`.exe`, `.deb`/`.AppImage`).
+   macOS builds are signed and notarized when the repository has Apple
+   credentials ([docs/release.md](docs/release.md)); an unsigned build opens
+   with right-click → Open the first time.
 2. Open **Providers**, add one (for example NVIDIA NIM), paste the API key,
    and click **Test connection**.
 3. On the **Models** tab, pick the default model (and optionally the
@@ -152,11 +155,6 @@ mkdir -p app/src-tauri/binaries
 cp target/release/ferry app/src-tauri/binaries/ferry-$(rustc -vV | sed -n 's/host: //p')
 cd app/src-tauri && cargo tauri build --config tauri.release.conf.json
 ```
-
-## Not yet
-
-* Signed and notarized macOS builds. The CI build is ad-hoc signed, so on
-  first launch use right-click → Open.
 
 ## License
 
