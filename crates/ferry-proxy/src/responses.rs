@@ -1,7 +1,7 @@
 //! OpenAI Responses ingress (Codex): request conversion to OpenAI Chat and
 //! re-encoding neutral events as Responses SSE.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use base64::Engine as _;
 use serde_json::{json, Map, Value};
@@ -16,6 +16,48 @@ pub struct ChatConversion {
     pub request: Value,
     /// Freeform (`custom`) tools exposed to the provider as one-string functions.
     pub custom_tools: HashSet<String>,
+    /// Functions from `namespace` tools: provider name -> (namespace, name).
+    pub namespaced: HashMap<String, (String, String)>,
+}
+
+/// Functions inside `namespace` tools (Codex groups its sub-agent tools
+/// this way), keyed by the flat name the provider sees: the function's own
+/// name, or `namespace__name` when that is taken.
+fn namespaced_functions(body: &Value) -> HashMap<String, (String, String)> {
+    let tools: Vec<&Value> = body["tools"].as_array().into_iter().flatten().collect();
+    let mut taken: HashMap<&str, usize> = HashMap::new();
+    for tool in &tools {
+        if tool["type"] == "namespace" {
+            for inner in tool["tools"].as_array().into_iter().flatten() {
+                if let Some(name) = inner["name"].as_str() {
+                    *taken.entry(name).or_default() += 1;
+                }
+            }
+        } else if let Some(name) = tool["name"].as_str() {
+            *taken.entry(name).or_insert(0) += 2;
+        }
+    }
+    let mut out = HashMap::new();
+    for tool in tools.iter().filter(|t| t["type"] == "namespace") {
+        let Some(namespace) = tool["name"].as_str() else {
+            continue;
+        };
+        for inner in tool["tools"].as_array().into_iter().flatten() {
+            if inner["type"] != "function" {
+                continue;
+            }
+            let Some(name) = inner["name"].as_str() else {
+                continue;
+            };
+            let flat = if taken.get(name) == Some(&1) {
+                name.to_string()
+            } else {
+                format!("{namespace}__{name}")
+            };
+            out.insert(flat, (namespace.to_string(), name.to_string()));
+        }
+    }
+    out
 }
 
 #[derive(Default)]
@@ -54,12 +96,13 @@ pub fn to_chat_request(body: &Value, model: &str, provider: &ProviderConfig) -> 
         }
     }
 
+    let namespaced = namespaced_functions(body);
     let mut assistant = PendingAssistant::default();
     match body.get("input") {
         Some(Value::String(text)) => messages.push(json!({"role": "user", "content": text})),
         Some(Value::Array(items)) => {
             for item in items {
-                input_item(item, provider, &mut assistant, &mut messages);
+                input_item(item, provider, &namespaced, &mut assistant, &mut messages);
             }
         }
         _ => {}
@@ -67,13 +110,30 @@ pub fn to_chat_request(body: &Value, model: &str, provider: &ProviderConfig) -> 
     assistant.flush(provider, &mut messages);
 
     let mut custom_tools = HashSet::new();
-    let tools: Vec<Value> = body
+    let mut tools: Vec<Value> = body
         .get("tools")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
         .filter_map(|tool| convert_tool(tool, &mut custom_tools))
         .collect();
+    for tool in body["tools"].as_array().into_iter().flatten() {
+        for inner in tool["tools"].as_array().into_iter().flatten() {
+            let (Some(namespace), Some(name)) = (tool["name"].as_str(), inner["name"].as_str())
+            else {
+                continue;
+            };
+            let flat = namespaced
+                .iter()
+                .find(|(_, (ns, n))| ns == namespace && n == name)
+                .map(|(flat, _)| flat.clone());
+            if let (Some(flat), Some(mut function)) = (flat, convert_tool(inner, &mut custom_tools))
+            {
+                function["function"]["name"] = json!(flat);
+                tools.push(function);
+            }
+        }
+    }
 
     let mut request = Map::new();
     request.insert("model".into(), json!(model));
@@ -128,6 +188,7 @@ pub fn to_chat_request(body: &Value, model: &str, provider: &ProviderConfig) -> 
     ChatConversion {
         request: Value::Object(request),
         custom_tools,
+        namespaced,
     }
 }
 
@@ -174,6 +235,7 @@ fn convert_tool(tool: &Value, custom_tools: &mut HashSet<String>) -> Option<Valu
 fn input_item(
     item: &Value,
     provider: &ProviderConfig,
+    namespaced: &HashMap<String, (String, String)>,
     assistant: &mut PendingAssistant,
     out: &mut Vec<Value>,
 ) {
@@ -196,7 +258,7 @@ fn input_item(
             "id": item.get("call_id").cloned().unwrap_or(json!("")),
             "type": "function",
             "function": {
-                "name": item.get("name").cloned().unwrap_or(json!("")),
+                "name": flat_name(item, namespaced),
                 "arguments": item.get("arguments").and_then(Value::as_str).unwrap_or("{}"),
             }
         })),
@@ -229,6 +291,20 @@ fn input_item(
             }
         }
         _ => {}
+    }
+}
+
+/// The provider-side name of a `function_call` item, which names a
+/// namespaced function by `namespace` plus `name`.
+fn flat_name(item: &Value, namespaced: &HashMap<String, (String, String)>) -> String {
+    let name = item["name"].as_str().unwrap_or("");
+    match item["namespace"].as_str() {
+        Some(namespace) => namespaced
+            .iter()
+            .find(|(_, (ns, n))| ns == namespace && n == name)
+            .map(|(flat, _)| flat.clone())
+            .unwrap_or_else(|| name.to_string()),
+        None => name.to_string(),
     }
 }
 
@@ -321,6 +397,7 @@ pub struct ResponsesEncoder {
     model: String,
     created_at: u64,
     custom_tools: HashSet<String>,
+    namespaced: HashMap<String, (String, String)>,
     sequence: u64,
     output: Vec<Value>,
     open: Option<Open>,
@@ -342,6 +419,7 @@ impl ResponsesEncoder {
             model: model.to_string(),
             created_at,
             custom_tools,
+            namespaced: HashMap::new(),
             sequence: 0,
             output: Vec::new(),
             open: None,
@@ -349,6 +427,12 @@ impl ResponsesEncoder {
             started: false,
             finished: false,
         }
+    }
+
+    /// Report calls to namespaced functions by their namespace and name.
+    pub fn with_namespaced(mut self, namespaced: HashMap<String, (String, String)>) -> Self {
+        self.namespaced = namespaced;
+        self
     }
 
     fn response(&self, status: &str) -> Value {
@@ -541,6 +625,10 @@ impl ResponsesEncoder {
                     let item_id = new_id("fc_");
                     let mut item = json!({"type": "function_call", "id": item_id, "call_id": call_id,
                                           "name": name, "arguments": "", "status": "in_progress"});
+                    if let Some((namespace, name)) = self.namespaced.get(&name) {
+                        item["namespace"] = json!(namespace);
+                        item["name"] = json!(name);
+                    }
                     self.emit(
                         &mut out,
                         "response.output_item.added",
@@ -702,6 +790,74 @@ mod tests {
         );
         assert_eq!(m[6]["tool_call_id"], "c2");
         assert_eq!(m[7]["content"], "Done.");
+    }
+
+    #[test]
+    fn namespace_tools_round_trip() {
+        let provider = crate::presets::PRESETS[0].to_provider();
+        let fun = |name: &str| {
+            json!({"type": "function", "name": name, "description": name,
+                                      "parameters": {"type": "object"}})
+        };
+        let body = json!({
+            "tools": [
+                fun("exec_command"),
+                {"type": "namespace", "name": "multi_agent_v1", "description": "Sub-agents",
+                 "tools": [fun("spawn_agent"), fun("wait_agent"), fun("exec_command")]}
+            ],
+            "input": [
+                {"type": "message", "role": "user", "content": "go"},
+                {"type": "function_call", "call_id": "c1", "namespace": "multi_agent_v1",
+                 "name": "spawn_agent", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "c1", "output": "agent-1"}
+            ]
+        });
+        let converted = to_chat_request(&body, "x", &provider);
+        let names: Vec<&str> = converted.request["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "exec_command",
+                "spawn_agent",
+                "wait_agent",
+                "multi_agent_v1__exec_command"
+            ]
+        );
+        let call = &converted.request["messages"][1]["tool_calls"][0];
+        assert_eq!(call["function"]["name"], "spawn_agent");
+
+        let mut encoder =
+            ResponsesEncoder::new("x", HashSet::new()).with_namespaced(converted.namespaced);
+        let frames: Vec<SseOut> = [
+            Event::ToolCall {
+                id: "c2".into(),
+                name: "multi_agent_v1__exec_command".into(),
+                arguments: "{}".into(),
+            },
+            Event::ToolCall {
+                id: "c3".into(),
+                name: "exec_command".into(),
+                arguments: "{}".into(),
+            },
+            Event::Finish(Finish::ToolCalls),
+        ]
+        .into_iter()
+        .flat_map(|e| encoder.push(e))
+        .collect();
+        let items: Vec<&Value> = frames
+            .iter()
+            .filter(|(n, _)| *n == "response.output_item.done")
+            .map(|(_, d)| &d["item"])
+            .collect();
+        assert_eq!(items[0]["name"], "exec_command");
+        assert_eq!(items[0]["namespace"], "multi_agent_v1");
+        assert_eq!(items[1]["name"], "exec_command");
+        assert!(items[1].get("namespace").is_none());
     }
 
     #[test]

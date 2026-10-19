@@ -822,7 +822,8 @@ async fn responses_handler(
         let conversion = build(&body, target);
         match open_events(&state, &config, &headers, target, &conversion.request).await {
             Ok(response) => {
-                let mut encoder = ResponsesEncoder::new(&requested, conversion.custom_tools);
+                let mut encoder = ResponsesEncoder::new(&requested, conversion.custom_tools)
+                    .with_namespaced(conversion.namespaced);
                 let source = body.clone();
                 let resume = Resume {
                     state: state.clone(),
