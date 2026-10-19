@@ -4,6 +4,7 @@
 
 pub mod acp;
 pub mod anthropic;
+pub mod codex_catalog;
 pub mod config;
 pub mod local;
 pub mod presets;

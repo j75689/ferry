@@ -23,7 +23,10 @@ codex ──model_providers.ferry──▶ │  /v1/responses (Codex)   │     
   `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` for the child process only.
 * **Codex** speaks the OpenAI Responses API. `ferry codex` adds a temporary
   `model_providers.ferry` entry through `-c` overrides. Your `~/.codex/config.toml`
-  is not touched.
+  is not touched. For Codex 0.163 and later it also writes a model catalog
+  (`codex-models.json` next to the config file) so Codex knows Ferry's models
+  instead of warning that their metadata is missing; `FERRY_CODEX_CATALOG=0`
+  turns that off.
 * The gateway turns both into OpenAI Chat Completions (or passes Messages
   straight through to Anthropic-compatible providers). It also converts the
   streamed answer back, including reasoning (`reasoning_content` or
@@ -113,6 +116,7 @@ api_key = "nvapi-…"            # or api_key_env = "NVIDIA_API_KEY"
 max_tokens_cap = 16384         # clamp Claude Code's 32k default for free tiers
 reasoning_history = false      # true for DeepSeek-style thinking + tools
 models = ["meta/llama-3.3-70b-instruct"]
+context_window = 128000        # what Codex is told; 128000 when unset
 ```
 
 ## Develop
@@ -140,7 +144,6 @@ cd app/src-tauri && cargo tauri build --config tauri.release.conf.json
 
 * Server-side tools (`web_search`, `web_fetch`) are dropped rather than
   emulated.
-* Codex prints a "model metadata not found" notice for non-OpenAI model names.
 * Signed and notarized macOS builds. The CI build is ad-hoc signed, so on
   first launch use right-click → Open.
 

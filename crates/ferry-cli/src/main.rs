@@ -169,7 +169,14 @@ fn toml_string(value: &str) -> String {
     serde_json::to_string(value).expect("string serializes")
 }
 
-fn plan(tool: Tool, url: &str, config: &Config, user_args: Vec<String>) -> Plan {
+/// `catalog` is a Codex model catalog file to point Codex at, if any.
+fn plan(
+    tool: Tool,
+    url: &str,
+    config: &Config,
+    catalog: Option<&std::path::Path>,
+    user_args: Vec<String>,
+) -> Plan {
     let token = config.server.auth_token.clone();
     let mut set = HashMap::new();
     match tool {
@@ -223,6 +230,12 @@ fn plan(tool: Tool, url: &str, config: &Config, user_args: Vec<String>) -> Plan 
             if !config.models.default.is_empty() {
                 overrides.push(("model", toml_string(&config.models.default)));
             }
+            if let Some(catalog) = catalog {
+                overrides.push((
+                    "model_catalog_json",
+                    toml_string(&catalog.display().to_string()),
+                ));
+            }
             for (key, value) in overrides {
                 args.push("-c".to_string());
                 args.push(format!("{key}={value}"));
@@ -260,6 +273,50 @@ fn child_env(plan: &Plan) -> Vec<(String, String)> {
     env
 }
 
+/// Where the Codex model catalog is written: next to the config file.
+fn catalog_path(config_path: &std::path::Path) -> std::path::PathBuf {
+    config_path.with_file_name("codex-models.json")
+}
+
+fn write_catalog(config: &Config, config_path: &std::path::Path) -> Result<std::path::PathBuf> {
+    let path = catalog_path(config_path);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let json = serde_json::to_string_pretty(&ferry_proxy::codex_catalog::catalog(config))?;
+    std::fs::write(&path, json).with_context(|| format!("cannot write {}", path.display()))?;
+    Ok(path)
+}
+
+/// Write the catalog for a Codex that reads it, so Codex knows Ferry's
+/// models. A Codex that cannot parse the catalog refuses to start, so older
+/// versions and `FERRY_CODEX_CATALOG=0` go without.
+fn codex_catalog(
+    binary: &std::path::Path,
+    config: &Config,
+    config_path: &std::path::Path,
+) -> Option<std::path::PathBuf> {
+    if std::env::var("FERRY_CODEX_CATALOG").is_ok_and(|v| v == "0") {
+        return None;
+    }
+    let version = std::process::Command::new(binary)
+        .arg("--version")
+        .output()
+        .ok()?;
+    let version = String::from_utf8_lossy(&version.stdout);
+    if !ferry_proxy::codex_catalog::supported_version(version.trim()) {
+        tracing::debug!(version = %version.trim(), "this Codex gets no model catalog");
+        return None;
+    }
+    match write_catalog(config, config_path) {
+        Ok(path) => Some(path),
+        Err(err) => {
+            tracing::warn!("cannot write the Codex model catalog: {err:#}");
+            None
+        }
+    }
+}
+
 async fn launch(tool: Tool, user_args: Vec<String>) -> Result<i32> {
     let binary = which::which(tool.binary()).with_context(|| {
         format!(
@@ -276,7 +333,11 @@ async fn launch(tool: Tool, user_args: Vec<String>) -> Result<i32> {
         );
     }
     let (url, owned) = ensure_gateway(&config, &path).await?;
-    let plan = plan(tool, &url, &config, user_args);
+    let catalog = match tool {
+        Tool::Codex => codex_catalog(&binary, &config, &path),
+        Tool::Claude => None,
+    };
+    let plan = plan(tool, &url, &config, catalog.as_deref(), user_args);
 
     // The child owns the terminal; keep Ctrl-C from killing our gateway.
     tokio::spawn(async {
@@ -300,7 +361,7 @@ async fn launch(tool: Tool, user_args: Vec<String>) -> Result<i32> {
 }
 
 async fn print_env(tool: Option<&str>) -> Result<()> {
-    let (config, _) = load_config()?;
+    let (config, path) = load_config()?;
     let url = config.local_url();
     let token = &config.server.auth_token;
     match tool.unwrap_or("claude") {
@@ -314,6 +375,16 @@ async fn print_env(tool: Option<&str>) -> Result<()> {
             println!("# ~/.codex/config.toml");
             println!("model_provider = \"ferry\"");
             println!("model = {}", toml_string(&config.models.default));
+            match write_catalog(&config, &path) {
+                Ok(catalog) => {
+                    println!("# Codex 0.163 or later: metadata for Ferry's models");
+                    println!(
+                        "model_catalog_json = {}",
+                        toml_string(&catalog.display().to_string())
+                    );
+                }
+                Err(err) => eprintln!("note: {err:#}"),
+            }
             println!();
             println!("[model_providers.ferry]");
             println!("name = \"Ferry\"");
@@ -352,12 +423,17 @@ mod tests {
 
     #[test]
     fn codex_plan_injects_provider_before_user_args() {
+        let catalog = std::path::Path::new("/tmp/codex-models.json");
         let plan = plan(
             Tool::Codex,
             "http://127.0.0.1:9",
             &config(),
+            Some(catalog),
             vec!["exec".into(), "hi".into()],
         );
+        assert!(plan
+            .args
+            .contains(&"model_catalog_json=\"/tmp/codex-models.json\"".to_string()));
         assert_eq!(plan.args[1], "model_provider=\"ferry\"");
         assert!(plan
             .args
@@ -369,7 +445,7 @@ mod tests {
 
     #[test]
     fn claude_plan_replaces_anthropic_env() {
-        let plan = plan(Tool::Claude, "http://127.0.0.1:9", &config(), vec![]);
+        let plan = plan(Tool::Claude, "http://127.0.0.1:9", &config(), None, vec![]);
         assert_eq!(plan.set["ANTHROPIC_BASE_URL"], "http://127.0.0.1:9");
         assert_eq!(plan.set["ANTHROPIC_AUTH_TOKEN"], "tok");
         assert_eq!(plan.set["CLAUDE_CODE_AUTO_MODE_SERVER"], "0");

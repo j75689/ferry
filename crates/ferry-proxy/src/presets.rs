@@ -168,6 +168,7 @@ impl Preset {
             } else {
                 vec![self.example_model.to_string()]
             },
+            context_window: None,
         }
     }
 }

@@ -130,6 +130,9 @@ pub struct ProviderConfig {
     /// Models advertised to clients from `/v1/models` (in addition to routed ones).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub models: Vec<String>,
+    /// Context window of this provider's models, in tokens, as told to Codex.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u32>,
 }
 
 impl ProviderConfig {
