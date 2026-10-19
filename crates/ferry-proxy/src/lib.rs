@@ -15,6 +15,7 @@ pub mod router;
 pub mod server;
 pub mod stream;
 pub mod upstream;
+pub mod websearch;
 
 use std::net::SocketAddr;
 

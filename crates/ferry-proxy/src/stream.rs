@@ -31,6 +31,8 @@ pub enum Event {
         name: String,
         arguments: String,
     },
+    /// A web search Ferry ran for the model (see [`crate::websearch`]).
+    WebSearch(crate::websearch::Search),
     Usage(Usage),
     Finish(Finish),
     Error(String),

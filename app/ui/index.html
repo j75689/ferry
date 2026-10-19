@@ -201,6 +201,39 @@ ferry codex exec "fix the tests"</code></pre>
           </div>
         </div>
         <div class="card">
+          <h2>Web search</h2>
+          <p class="hint">When Claude Code or Codex uses its built-in web search, Ferry runs the search from this machine and gives the model the results.</p>
+          <label class="check"><input type="checkbox" id="w-enabled"> Run web searches for the model</label>
+          <div class="grid">
+            <div class="field">
+              <label for="w-backend">Search backend</label>
+              <select id="w-backend">
+                <option value="duckduckgo">DuckDuckGo (no key)</option>
+                <option value="brave">Brave Search API</option>
+                <option value="searxng">SearXNG</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="w-results">Results per search</label>
+              <input id="w-results" type="number" min="1" max="20" class="mono">
+            </div>
+            <div class="field" id="w-url-field">
+              <label for="w-url">SearXNG URL <span class="req" aria-hidden="true">*</span></label>
+              <input id="w-url" class="mono" placeholder="https://searx.example.org" aria-describedby="w-url-help w-url-error">
+              <p class="help" id="w-url-help">The instance must have the JSON format enabled.</p>
+              <p class="error" id="w-url-error"></p>
+            </div>
+            <div class="field" id="w-key-field">
+              <label for="w-key">Brave API key <span class="req" aria-hidden="true">*</span></label>
+              <input id="w-key" class="mono" autocomplete="off" aria-describedby="w-key-error">
+              <p class="error" id="w-key-error"></p>
+            </div>
+          </div>
+          <div class="actions">
+            <button class="button primary" type="button" data-save>Save</button>
+          </div>
+        </div>
+        <div class="card">
           <h2>Appearance</h2>
           <div class="field narrow">
             <label for="theme">Theme</label>

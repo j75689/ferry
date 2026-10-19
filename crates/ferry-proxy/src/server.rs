@@ -28,6 +28,7 @@ use crate::review;
 use crate::router::{self, Target};
 use crate::stream::{Event, Finish, Usage};
 use crate::upstream::{self, EventStream, UpstreamError};
+use crate::websearch;
 
 const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
 const LOG_CAPACITY: usize = 200;
@@ -416,6 +417,48 @@ async fn open_events(
     }
 }
 
+/// Run the turn through Ferry's web search loop when the client offered a
+/// hosted search tool; follow-up requests go to the same target.
+fn with_web_search(
+    events: impl Stream<Item = Event> + Send + 'static,
+    plan: Option<websearch::Plan>,
+    chat: &Value,
+    (state, config, headers, target): (&AppState, &Arc<Config>, &HeaderMap, &Target),
+) -> EventStream {
+    let Some(plan) = plan else {
+        return Box::pin(events);
+    };
+    let reopen: websearch::Reopen = {
+        let (state, config, headers, target) = (
+            state.clone(),
+            config.clone(),
+            headers.clone(),
+            target.clone(),
+        );
+        Arc::new(move |chat: Value| {
+            let (state, config, headers, target) = (
+                state.clone(),
+                config.clone(),
+                headers.clone(),
+                target.clone(),
+            );
+            Box::pin(async move { open_events(&state, &config, &headers, &target, &chat).await })
+        })
+    };
+    let searcher = websearch::Searcher {
+        http: state.http().clone(),
+        config: config.web_search.clone(),
+    };
+    Box::pin(websearch::run(
+        events,
+        chat.clone(),
+        plan,
+        searcher,
+        target.provider.reasoning_history,
+        reopen,
+    ))
+}
+
 /// Builds the OpenAI Chat request for a target, or `None` if the target
 /// cannot serve this kind of request.
 type BuildRequest = Arc<dyn Fn(&Target) -> Option<Value> + Send + Sync>;
@@ -557,6 +600,11 @@ async fn messages(State(state): State<AppState>, headers: HeaderMap, body: Bytes
         .to_string();
     let wants_stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let verdict_fixer = review::VerdictFixer::for_request(&body);
+    let search = config
+        .web_search
+        .enabled
+        .then(|| websearch::messages_plan(&body))
+        .flatten();
     let api = if review::prepare(&mut body) {
         "messages (auto-mode review)"
     } else {
@@ -584,7 +632,8 @@ async fn messages(State(state): State<AppState>, headers: HeaderMap, body: Bytes
     for (index, target) in targets.iter().enumerate() {
         recorder.record.routed_model = target.reference();
         match target.provider.kind {
-            ProviderKind::Anthropic => {
+            // Hosted search needs Ferry's loop, so it takes the converted path.
+            ProviderKind::Anthropic if search.is_none() => {
                 let mut native = body.clone();
                 native["model"] = json!(target.model);
                 if let (Some(cap), Some(max)) = (
@@ -601,8 +650,16 @@ async fn messages(State(state): State<AppState>, headers: HeaderMap, body: Bytes
                     Err(err) => last_error = Some(err),
                 }
             }
-            ProviderKind::OpenaiChat | ProviderKind::Antigravity => {
-                let chat = anthropic::to_chat_request(&body, &target.model, &target.provider);
+            _ => {
+                let searching = search.is_some();
+                let build = move |source: &Value, t: &Target| {
+                    let mut chat = anthropic::to_chat_request(source, &t.model, &t.provider);
+                    if searching {
+                        websearch::add_tool(&mut chat);
+                    }
+                    chat
+                };
+                let chat = build(&body, target);
                 match open_events(&state, &config, &headers, target, &chat).await {
                     Ok(response) => {
                         let estimate = anthropic::estimate_input_tokens(&body);
@@ -613,25 +670,28 @@ async fn messages(State(state): State<AppState>, headers: HeaderMap, body: Bytes
                             config: config.clone(),
                             headers: headers.clone(),
                             targets: targets.clone(),
-                            build: Arc::new(move |t: &Target| {
-                                Some(anthropic::to_chat_request(&source, &t.model, &t.provider))
-                            }),
+                            build: Arc::new(move |t: &Target| Some(build(&source, t))),
                         };
                         let mut fixer = verdict_fixer;
                         let events =
-                            resumable_events(resume, index, response, recorder.resumed_on.clone())
-                                .flat_map(move |event| {
-                                    let events = match fixer.as_mut() {
-                                        Some(fixer) => {
-                                            let events = fixer.push(event);
-                                            let note =
-                                                fixer.outcome.map(|o| format!("verdict: {o}"));
-                                            events.into_iter().map(|e| (e, note.clone())).collect()
-                                        }
-                                        None => vec![(event, None)],
-                                    };
-                                    futures_util::stream::iter(events)
-                                });
+                            resumable_events(resume, index, response, recorder.resumed_on.clone());
+                        let events = with_web_search(
+                            events,
+                            search.clone(),
+                            &chat,
+                            (&state, &config, &headers, target),
+                        )
+                        .flat_map(move |event| {
+                            let events = match fixer.as_mut() {
+                                Some(fixer) => {
+                                    let events = fixer.push(event);
+                                    let note = fixer.outcome.map(|o| format!("verdict: {o}"));
+                                    events.into_iter().map(|e| (e, note.clone())).collect()
+                                }
+                                None => vec![(event, None)],
+                            };
+                            futures_util::stream::iter(events)
+                        });
                         if wants_stream {
                             let frames = async_stream::stream! {
                                 let mut recorder = recorder;
@@ -743,10 +803,23 @@ async fn responses_handler(
             return responses_error(400, &err.to_string());
         }
     };
+    let search = config
+        .web_search
+        .enabled
+        .then(|| websearch::responses_plan(&body))
+        .flatten();
+    let searching = search.is_some();
+    let build = move |source: &Value, t: &Target| {
+        let mut conversion = responses::to_chat_request(source, &t.model, &t.provider);
+        if searching {
+            websearch::add_tool(&mut conversion.request);
+        }
+        conversion
+    };
     let mut last_error = None;
     for (index, target) in targets.iter().enumerate() {
         recorder.record.routed_model = target.reference();
-        let conversion = responses::to_chat_request(&body, &target.model, &target.provider);
+        let conversion = build(&body, target);
         match open_events(&state, &config, &headers, target, &conversion.request).await {
             Ok(response) => {
                 let mut encoder = ResponsesEncoder::new(&requested, conversion.custom_tools);
@@ -756,11 +829,15 @@ async fn responses_handler(
                     config: config.clone(),
                     headers: headers.clone(),
                     targets: targets.clone(),
-                    build: Arc::new(move |t: &Target| {
-                        Some(responses::to_chat_request(&source, &t.model, &t.provider).request)
-                    }),
+                    build: Arc::new(move |t: &Target| Some(build(&source, t).request)),
                 };
                 let events = resumable_events(resume, index, response, recorder.resumed_on.clone());
+                let events = with_web_search(
+                    events,
+                    search.clone(),
+                    &conversion.request,
+                    (&state, &config, &headers, target),
+                );
                 if wants_stream {
                     let frames = async_stream::stream! {
                         let mut recorder = recorder;

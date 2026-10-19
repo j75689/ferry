@@ -19,6 +19,69 @@ pub struct Config {
     pub providers: Vec<ProviderConfig>,
     #[serde(default)]
     pub optimizations: Optimizations,
+    #[serde(default)]
+    pub web_search: WebSearchConfig,
+}
+
+/// Where Ferry searches when a client's hosted web search tool is used
+/// (Claude Code's WebSearch, Codex's `web_search`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WebSearchConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub backend: SearchBackend,
+    /// Endpoint override; required for SearXNG (its base URL).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub url: String,
+    /// API key for Brave Search.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub api_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_env: Option<String>,
+    #[serde(default = "default_max_results")]
+    pub max_results: usize,
+}
+
+impl Default for WebSearchConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            backend: SearchBackend::default(),
+            url: String::new(),
+            api_key: String::new(),
+            api_key_env: None,
+            max_results: default_max_results(),
+        }
+    }
+}
+
+impl WebSearchConfig {
+    pub fn resolved_api_key(&self) -> String {
+        if !self.api_key.is_empty() {
+            return self.api_key.clone();
+        }
+        self.api_key_env
+            .as_deref()
+            .and_then(|name| std::env::var(name).ok())
+            .unwrap_or_default()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchBackend {
+    /// DuckDuckGo's HTML results page; no key.
+    #[default]
+    Duckduckgo,
+    /// Brave Search API; needs `api_key`.
+    Brave,
+    /// A SearXNG instance with the JSON format enabled; needs `url`.
+    Searxng,
+}
+
+fn default_max_results() -> usize {
+    8
 }
 
 /// Requests Ferry answers itself instead of spending a provider call.
@@ -177,6 +240,7 @@ impl Default for Config {
             models: ModelConfig::default(),
             providers: Vec::new(),
             optimizations: Optimizations::default(),
+            web_search: WebSearchConfig::default(),
         }
     }
 }
@@ -241,6 +305,12 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<()> {
+        if self.web_search.enabled
+            && self.web_search.backend == SearchBackend::Searxng
+            && self.web_search.url.trim().is_empty()
+        {
+            bail!("web_search: the searxng backend needs url");
+        }
         let models = &self.models;
         let tiers = [&models.opus, &models.sonnet, &models.haiku];
         let references = std::iter::once(&models.default)

@@ -568,7 +568,7 @@ async function refreshRequests() {
           el("span", { class: "sr-only" }, " routed to "),
           el("span", { class: "mono" }, r.routed_model || "(not routed)")),
         el("p", { class: "request-meta" },
-          `${new Date(r.started_at_ms).toLocaleTimeString()} · ${r.api === "messages" ? "Claude Code" : "Codex"} · ` +
+          `${new Date(r.started_at_ms).toLocaleTimeString()} · ${r.api.startsWith("messages") ? "Claude Code" : "Codex"} · ` +
           `${(r.duration_ms / 1000).toFixed(1)} s · ${r.input_tokens} in / ${r.output_tokens} out tokens`),
         detail ? el("p", { class: "request-detail" }, detail) : null));
   }));
@@ -587,11 +587,38 @@ function renderSettings() {
   const o = draft.optimizations || {};
   $("o-titles").checked = o.local_session_titles !== false;
   $("o-quota").checked = o.local_quota_probe !== false;
+  const w = webSearch();
+  $("w-enabled").checked = w.enabled;
+  $("w-backend").value = w.backend;
+  $("w-results").value = w.max_results;
+  $("w-url").value = w.url || "";
+  $("w-key").value = w.api_key || "";
+  showSearchFields();
+}
+
+const SEARCH_DEFAULTS = { enabled: true, backend: "duckduckgo", max_results: 8 };
+
+function webSearch() {
+  draft.web_search = { ...SEARCH_DEFAULTS, ...draft.web_search };
+  return draft.web_search;
+}
+
+function showSearchFields() {
+  const w = webSearch();
+  $("w-url-field").hidden = w.backend !== "searxng";
+  $("w-key-field").hidden = w.backend !== "brave";
+  for (const id of ["w-backend", "w-results", "w-url", "w-key"]) $(id).disabled = !w.enabled;
 }
 
 function validateSettings() {
   const port = Number(draft.server.port);
-  return setError($("s-port"), Number.isInteger(port) && port >= 1 && port <= 65535 ? null : "Enter a port from 1 to 65535.");
+  const portOk = setError($("s-port"), Number.isInteger(port) && port >= 1 && port <= 65535 ? null : "Enter a port from 1 to 65535.");
+  const w = webSearch();
+  const urlOk = setError($("w-url"),
+    w.enabled && w.backend === "searxng" && !/^https?:\/\/\S+$/.test(w.url || "") ? "Enter the instance URL, starting with http:// or https://." : null);
+  const keyOk = setError($("w-key"),
+    w.enabled && w.backend === "brave" && !w.api_key && !w.api_key_env ? "Enter a Brave Search API key." : null);
+  return portOk && urlOk && keyOk;
 }
 
 function applyTheme(theme) {
@@ -613,6 +640,18 @@ function bindSettings() {
   };
   $("o-titles").addEventListener("change", toggle("local_session_titles"));
   $("o-quota").addEventListener("change", toggle("local_quota_probe"));
+  const search = (key, read) => (e) => {
+    webSearch()[key] = read(e.target);
+    showSearchFields();
+    markDirty();
+  };
+  $("w-enabled").addEventListener("change", search("enabled", (t) => t.checked));
+  $("w-backend").addEventListener("change", search("backend", (t) => t.value));
+  $("w-results").addEventListener("input", search("max_results", (t) => Math.max(1, Number(t.value) || 1)));
+  $("w-url").addEventListener("input", search("url", (t) => t.value.trim()));
+  $("w-key").addEventListener("input", search("api_key", (t) => t.value.trim()));
+  $("w-url").addEventListener("blur", validateSettings);
+  $("w-key").addEventListener("blur", validateSettings);
   $("regen-token").addEventListener("click", (e) => busy(e.currentTarget, async () => {
     draft.server.auth_token = await invoke("new_token");
     $("s-token").value = draft.server.auth_token;
@@ -670,7 +709,7 @@ function validateAll() {
   }
   if (!validateSettings()) {
     location.hash = "settings";
-    $("s-port").focus();
+    document.querySelector('#page-settings [aria-invalid="true"]')?.focus();
     return false;
   }
   return true;

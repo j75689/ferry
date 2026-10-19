@@ -8,6 +8,9 @@
 //! Requests for the model `flaky` drop the connection halfway through the
 //! first answer, to exercise stream resumption. `POST /v1/messages` behaves
 //! the same way in Anthropic format, for `kind = "anthropic"` providers.
+//! When offered Ferry's `web_search` function and asked to `SEARCH_WEB` (or
+//! by Claude Code's WebSearch), it searches once and quotes the first
+//! result; `GET /search` is a SearXNG-style backend with fixed results.
 
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
@@ -94,6 +97,16 @@ async fn chat(Json(body): Json<Value>) -> axum::response::Response {
         });
     let mut chunks =
         vec![json!({"choices":[{"delta":{"reasoning_content":"Mock provider thinking."}}]})];
+    if let Some(reply) = web_search_turn(&body, &messages, &user_text) {
+        chunks.extend(reply);
+        chunks.push(json!({"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":10}}));
+        let mut sse = String::new();
+        for chunk in chunks {
+            sse.push_str(&format!("data: {chunk}\n\n"));
+        }
+        sse.push_str("data: [DONE]\n\n");
+        return ([("content-type", "text/event-stream")], sse).into_response();
+    }
     let tool_output = messages
         .iter()
         .rev()
@@ -131,6 +144,73 @@ async fn chat(Json(body): Json<Value>) -> axum::response::Response {
     }
     sse.push_str("data: [DONE]\n\n");
     ([("content-type", "text/event-stream")], sse).into_response()
+}
+
+/// Search once through Ferry's `web_search`, then quote the first result.
+fn web_search_turn(body: &Value, messages: &[Value], user_text: &[String]) -> Option<Vec<Value>> {
+    let offered = body["tools"]
+        .as_array()?
+        .iter()
+        .any(|t| t["function"]["name"] == "web_search");
+    let query = user_text.iter().find_map(|t| {
+        t.split_once("Perform a web search for the query:")
+            .map(|(_, q)| q.trim().to_string())
+            .or_else(|| {
+                t.contains("SEARCH_WEB")
+                    .then(|| "ferry rust gateway".to_string())
+            })
+    })?;
+    let result = messages
+        .iter()
+        .rev()
+        .find(|m| m["role"] == "tool")
+        .map(|m| text_of(&m["content"]));
+    if !offered {
+        // Claude Code's main turn: call its WebSearch tool, which sends the
+        // search request with the hosted tool.
+        let has_web_search = body["tools"]
+            .as_array()?
+            .iter()
+            .any(|t| t["function"]["name"] == "WebSearch");
+        if !has_web_search || result.is_some() {
+            return None;
+        }
+        return Some(vec![
+            json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_ws1","type":"function",
+            "function":{"name":"WebSearch","arguments":json!({"query": query}).to_string()}}]},
+            "finish_reason":"tool_calls"}]}),
+        ]);
+    }
+    Some(match result {
+        None => vec![
+            json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_search1","type":"function",
+            "function":{"name":"web_search","arguments":json!({"query": query}).to_string()}}]},
+            "finish_reason":"tool_calls"}]}),
+        ],
+        Some(result) => {
+            let first = result
+                .lines()
+                .map(str::trim)
+                .find(|l| l.starts_with("http"))
+                .unwrap_or("nothing")
+                .to_string();
+            vec![
+                json!({"choices":[{"delta":{"content":format!("Search said: {first}")}}]}),
+                json!({"choices":[{"delta":{},"finish_reason":"stop"}]}),
+            ]
+        }
+    })
+}
+
+/// A SearXNG-style search backend: `GET /search?q=...&format=json`.
+async fn search(
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> Json<Value> {
+    let query = params.get("q").cloned().unwrap_or_default();
+    Json(json!({"results": [
+        {"title": format!("{query} - first result"), "url": "https://example.com/first", "content": "The first mock result."},
+        {"title": "Second", "url": "https://example.org/second", "content": "Another mock result."}
+    ]}))
 }
 
 /// The same behaviour as `chat`, speaking the Anthropic Messages API.
@@ -225,7 +305,8 @@ async fn main() {
     let app = Router::new()
         .route("/v1/chat/completions", post(chat))
         .route("/v1/messages", post(messages))
-        .route("/v1/models", get(models));
+        .route("/v1/models", get(models))
+        .route("/search", get(search));
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
         .await
         .unwrap();

@@ -189,7 +189,7 @@ main { padding: var(--space-6) var(--space-6) 64px; max-width: 1080px; width: 10
 main:focus { outline: none; }
 
 .page { display: grid; gap: var(--space-4); }
-.page[hidden] { display: none; }
+.page[hidden], .field[hidden] { display: none; }
 .page-head { display: grid; gap: var(--space-1); margin-bottom: var(--space-2); }
 .lede { color: var(--color-muted-foreground); max-width: 70ch; }
 

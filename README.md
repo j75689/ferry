@@ -49,6 +49,14 @@ codex ──model_providers.ferry──▶ │  /v1/responses (Codex)   │     
   because the server-side review only exists on Anthropic's API. A weak model
   can still block actions it should allow; map `sonnet` (which the review
   uses) to a capable model, or leave auto mode with Shift+Tab.
+* Web search works on every provider. Claude Code's WebSearch and Codex's
+  `web_search` are hosted tools that only OpenAI's and Anthropic's servers
+  run; Ferry offers the model a `web_search` function instead, runs the
+  search itself (DuckDuckGo by default, or Brave Search or a SearXNG
+  instance), shows the client the search in its own format, and lets the
+  model continue with the results. Searches go out from your machine; turn
+  this off under `[web_search]` or in the app's Settings. (Claude Code's
+  WebFetch already runs on your machine and needs nothing from Ferry.)
 * Every provider kind serves both clients: Claude Code and Codex requests are
   converted to whatever API the target provider speaks.
   Claude Code requests to Anthropic-type providers are passed through as-is.
@@ -117,6 +125,11 @@ max_tokens_cap = 16384         # clamp Claude Code's 32k default for free tiers
 reasoning_history = false      # true for DeepSeek-style thinking + tools
 models = ["meta/llama-3.3-70b-instruct"]
 context_window = 128000        # what Codex is told; 128000 when unset
+
+[web_search]
+enabled = true
+backend = "duckduckgo"         # or "brave" (api_key) or "searxng" (url)
+max_results = 8
 ```
 
 ## Develop
@@ -142,8 +155,6 @@ cd app/src-tauri && cargo tauri build --config tauri.release.conf.json
 
 ## Not yet
 
-* Server-side tools (`web_search`, `web_fetch`) are dropped rather than
-  emulated.
 * Signed and notarized macOS builds. The CI build is ad-hoc signed, so on
   first launch use right-click → Open.
 

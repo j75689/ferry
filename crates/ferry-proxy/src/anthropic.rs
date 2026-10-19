@@ -278,6 +278,19 @@ fn assistant_message(content: Option<&Value>, provider: &ProviderConfig) -> Valu
                     }
                 }));
             }
+            // Earlier hosted searches: keep what was found as plain text.
+            Some("server_tool_use") => {
+                if let Some(query) = block.pointer("/input/query").and_then(Value::as_str) {
+                    text.push_str(&format!("\n[Searched the web for: {query}]\n"));
+                }
+            }
+            Some("web_search_tool_result") => {
+                for hit in block["content"].as_array().into_iter().flatten() {
+                    if let (Some(title), Some(url)) = (hit["title"].as_str(), hit["url"].as_str()) {
+                        text.push_str(&format!("- {title} ({url})\n"));
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -492,6 +505,8 @@ pub struct AnthropicEncoder {
     started: bool,
     finished: bool,
     usage: Usage,
+    /// Web searches Ferry ran during this message.
+    searches: u64,
 }
 
 pub type SseOut = (&'static str, Value);
@@ -506,6 +521,7 @@ impl AnthropicEncoder {
             started: false,
             finished: false,
             usage: Usage::default(),
+            searches: 0,
         }
     }
 
@@ -611,6 +627,48 @@ impl AnthropicEncoder {
                 ));
                 self.index += 1;
             }
+            Event::WebSearch(search) => {
+                self.close(&mut out);
+                self.searches += 1;
+                out.push((
+                    "content_block_start",
+                    json!({"type": "content_block_start", "index": self.index,
+                           "content_block": {"type": "server_tool_use", "id": search.id, "name": "web_search", "input": {}}}),
+                ));
+                out.push((
+                    "content_block_delta",
+                    json!({"type": "content_block_delta", "index": self.index,
+                           "delta": {"type": "input_json_delta", "partial_json": json!({"query": search.query}).to_string()}}),
+                ));
+                out.push((
+                    "content_block_stop",
+                    json!({"type": "content_block_stop", "index": self.index}),
+                ));
+                self.index += 1;
+                let content = match &search.outcome {
+                    Ok(hits) => Value::Array(
+                        hits.iter()
+                            .map(|hit| {
+                                json!({"type": "web_search_result", "title": hit.title,
+                                              "url": hit.url, "page_age": hit.age})
+                            })
+                            .collect(),
+                    ),
+                    Err(failure) => {
+                        json!({"type": "web_search_tool_result_error", "error_code": failure.code})
+                    }
+                };
+                out.push((
+                    "content_block_start",
+                    json!({"type": "content_block_start", "index": self.index,
+                           "content_block": {"type": "web_search_tool_result", "tool_use_id": search.id, "content": content}}),
+                ));
+                out.push((
+                    "content_block_stop",
+                    json!({"type": "content_block_stop", "index": self.index}),
+                ));
+                self.index += 1;
+            }
             Event::Usage(usage) => self.usage = usage,
             Event::Finish(finish) => {
                 self.close(&mut out);
@@ -624,13 +682,17 @@ impl AnthropicEncoder {
                 } else {
                     self.input_estimate
                 };
+                let mut usage = json!({"input_tokens": input,
+                                       "output_tokens": self.usage.output_tokens,
+                                       "cache_read_input_tokens": self.usage.cached_tokens});
+                if self.searches > 0 {
+                    usage["server_tool_use"] = json!({"web_search_requests": self.searches});
+                }
                 out.push((
                     "message_delta",
                     json!({"type": "message_delta",
                            "delta": {"stop_reason": stop_reason, "stop_sequence": null},
-                           "usage": {"input_tokens": input,
-                                     "output_tokens": self.usage.output_tokens,
-                                     "cache_read_input_tokens": self.usage.cached_tokens}}),
+                           "usage": usage}),
                 ));
                 out.push(("message_stop", json!({"type": "message_stop"})));
                 self.finished = true;

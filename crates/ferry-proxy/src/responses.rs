@@ -221,6 +221,13 @@ fn input_item(
                 assistant.reasoning.push_str(&text);
             }
         }
+        "web_search_call" => {
+            if let Some(query) = item.pointer("/action/query").and_then(Value::as_str) {
+                assistant
+                    .text
+                    .push_str(&format!("[Searched the web for: {query}]\n"));
+            }
+        }
         _ => {}
     }
 }
@@ -558,6 +565,46 @@ impl ResponsesEncoder {
                     );
                     self.output.push(item);
                 }
+            }
+            Event::WebSearch(search) => {
+                self.close(&mut out);
+                let index = self.output_index();
+                let item_id = new_id("ws_");
+                let item = json!({"type": "web_search_call", "id": item_id, "status": "in_progress",
+                                  "action": {"type": "search", "query": search.query}});
+                self.emit(
+                    &mut out,
+                    "response.output_item.added",
+                    json!({"output_index": index, "item": item}),
+                );
+                for name in [
+                    "response.web_search_call.in_progress",
+                    "response.web_search_call.searching",
+                    "response.web_search_call.completed",
+                ] {
+                    self.emit(
+                        &mut out,
+                        name,
+                        json!({"item_id": item_id, "output_index": index}),
+                    );
+                }
+                let sources: Vec<Value> = search
+                    .outcome
+                    .as_ref()
+                    .map(|hits| {
+                        hits.iter()
+                            .map(|hit| json!({"type": "url", "url": hit.url}))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let item = json!({"type": "web_search_call", "id": item_id, "status": "completed",
+                                  "action": {"type": "search", "query": search.query, "sources": sources}});
+                self.emit(
+                    &mut out,
+                    "response.output_item.done",
+                    json!({"output_index": index, "item": item}),
+                );
+                self.output.push(item);
             }
             Event::Usage(usage) => self.usage = usage,
             Event::Finish(finish) => {
